@@ -2,7 +2,7 @@
 
 Milestone-based escrow for freelance work, written in Solidity with Foundry and OpenZeppelin Contracts v5.
 
-> **Status:** Stage 3B (delivery expiry and claims) of a portfolio project. Unaudited and intended for local development and testnets only.
+> **Status:** Stage 3C (arbitrator registry) of a portfolio project. Unaudited and intended for local development and testnets only.
 > Do not use it with real funds.
 
 ## Architecture
@@ -11,6 +11,7 @@ Milestone-based escrow for freelance work, written in Solidity with Foundry and 
 | ------------------ | -------------------------------------------------------------------------------------- |
 | `TrustWorkFactory` | Deploys an independent `WorkOrder` per engagement. The caller becomes the client.     |
 | `WorkOrder`        | Holds one engagement's budget and releases it milestone by milestone.                  |
+| `ArbitratorRegistry` | Stake ledger and per-dispute candidate snapshots for the planned arbitration court. Not yet connected to orders. |
 
 Each order is its own contract, so funds and state of different engagements never mix. There is no owner, admin,
 upgrade path, or pause switch. Escrowed tokens leave an order only through settlement (to the fee recipient and the
@@ -305,6 +306,56 @@ target).
   relayer.
 - Timestamps are stored as `uint64` via `SafeCast`.
 
+## Arbitrator registry
+
+`ArbitratorRegistry` is slice S2 of the arbitration design
+([`docs/stage-3-arbitration-design.md`](docs/stage-3-arbitration-design.md), sections 7–8). It is deployed by the
+contract that becomes its immutable `court`; in this stage only a test harness plays that role. No order, factory or
+court uses it yet.
+
+**Construction.** `stakeToken` (nonzero, has code), `seatLock` (positive, fits `uint128`) and `penaltyRecipient`
+(nonzero, and neither the court nor the registry itself, so a protocol contract can never be the final beneficiary of
+its own penalties; any other contract is accepted). There is no owner, setter, pause, upgrade or rescue function.
+
+**Stake.** Each account has `stake` (matured), `warming`, `reserved` and `locked`:
+
+- `deposit(amount)` adds to `warming` after maturing any warming stake whose `warmingUntil` has passed, and restarts
+  `warmingUntil = now + 2 days` for the remaining warming bucket. Matured stake never becomes warming again. Deposits
+  use an exact balance check; the penalty recipient cannot deposit.
+- An unlisted account is listed only if its principal after the deposit is at least `seatLock` and fewer than 32
+  accounts are listed (`BelowListingMinimum`, `RegistryFull`).
+- `withdraw(amount)` pays out at most `stake - locked - reserved`, with no delay. Any withdrawal or penalty that drops
+  `stake + warming` below `seatLock` delists the account by swap-and-pop; its remaining balance stays withdrawable.
+
+**Snapshots.** The court-only `reserveCandidates(disputeId, excluded)` scans the (at most 32) listed accounts and takes
+those with at least `seatLock` of free matured stake that are not excluded, in listing order. With fewer than three it
+returns the count and writes nothing, not even maturation. Otherwise it reserves `seatLock` from each candidate and
+stores the list. Later deposits, maturation, withdrawals, penalties in other disputes, delisting and slot reuse do not
+change a stored snapshot, and `locked + reserved <= stake` always holds.
+
+**Selection and release.** `selectPanel(disputeId, seed)` picks three distinct stored candidates with the partial
+Fisher–Yates of `PanelSelection`, locks them and releases every other reservation. The registry uses the seed it is
+given and does not source randomness; selection is uniform only to the extent the seed is, and splitting stake across
+addresses increases expected seats (design section 7.6). `releaseReservations` frees a snapshot that never formed a
+panel. `releaseSeat(disputeId, index, penalty)` frees one locked seat, forfeits `penalty <= seatLock` of its stake to
+the court, and rejects unknown disputes, out-of-range indexes and seats that are not currently locked.
+
+**Accounting.** `totalStaked == sum(stake + warming)`, `depositsReceived == withdrawalsPaid + penaltiesSent +
+totalStaked`, and the token balance equals `totalStaked` plus unsolicited transfers, which create no principal.
+
+**Gas** (32 candidates, half with matured warming stake to materialize; storage marked cold with `vm.cool` before each
+call; measured as the external call into the court harness, excluding the 21,000 intrinsic cost and calldata):
+
+| Operation | Measured | Target |
+| --- | --- | --- |
+| `reserveCandidates` | 1,580,724 | ≤ 2,000,000 |
+| `selectPanel` | 245,173 | ≤ 800,000 |
+| `releaseReservations` | 170,399 | ≤ 800,000 |
+
+The first measurement was 2,284,500 for the snapshot. Packing account fields into three storage slots (`stake` with
+`reserved`, `warming` with `locked`, `warmingUntil` with `listed`) brought it under the target without changing
+behavior; the public `accountOf` view still returns `uint256` amounts.
+
 ## Development
 
 Toolchain: Foundry 1.5.1-stable, solc 0.8.28 (EVM `cancun`), OpenZeppelin Contracts v5.6.1, forge-std v1.11.0.
@@ -320,7 +371,9 @@ forge coverage
 
 Tests are split into unit tests (`test/TrustWorkFactory.t.sol`, `test/WorkOrder.t.sol`,
 `test/WorkOrder.signature.t.sol`, `test/WorkOrder.permit.t.sol`, `test/WorkOrder.delivery.t.sol`), fuzz tests (`test/WorkOrder.fuzz.t.sol`) and a
-stateful invariant suite (`test/invariant/`) that mixes all funding, settlement, reclaim and claim paths.
+stateful invariant suite (`test/invariant/`) that mixes all funding, settlement, reclaim and claim paths. Registry
+tests live in `test/registry/` (unit, matrix M0, fuzz against a reference model, gas) and
+`test/invariant/ArbitratorRegistry*.sol`; `test/mocks/RegistryCourtHarness.sol` stands in for the court.
 `test/WorkOrder.delivery.t.sol` also contains a deterministic matrix of every funding path × reclaim at the first,
 middle and last milestone (9 cases); fuzz and invariant runs sample combinations rather than enumerating them. Mocks under `test/mocks/`
 are test-only: `MockUSDC` (6 decimals, open minting), `MockPermitUSDC` (adds ERC-2612), a fee-on-transfer token, a
@@ -336,8 +389,9 @@ claims).
 Not implemented in this stage:
 
 - disputes and arbitration — a submitted milestone is either approved or auto-released after the review period, and
-  the client can only reclaim milestones that were never submitted in time (the design for the remaining slices is
-  in [`docs/stage-3-arbitration-design.md`](docs/stage-3-arbitration-design.md));
+  the client can only reclaim milestones that were never submitted in time. The arbitrator registry exists but no
+  court, seed scheduling, voting or order integration does yet (the design for the remaining slices is in
+  [`docs/stage-3-arbitration-design.md`](docs/stage-3-arbitration-design.md));
 - cancellation by agreement, and any refund other than delivery-expiry reclaim;
 - recovery of unsolicited tokens sent directly to an order;
 - reputation, governance, frontend, deployment scripts, and a relayer service.

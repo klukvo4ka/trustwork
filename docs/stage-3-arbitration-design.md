@@ -1,7 +1,8 @@
 # Stage 3 — Arbitration design
 
 Status: Stage 3A design (revision 2, accepted at `f0a1c1b`) with narrow corrections made during slice S1. Slice S1
-(Stage 3B) is implemented; sections describing the court, registry and disputes are not.
+(Stage 3B) and the registry of slice S2 (Stage 3C) are implemented; sections describing the court and disputes are
+not.
 Baseline: Stage 2, commit `5746ac19e947d4c72b5dbfcf518e4b05ba199165`. Revision 1: `8a3995e`. Section 15 maps the
 review findings R1–R6 to the sections that resolve them.
 
@@ -244,6 +245,7 @@ S4 measures both.
 | One seat per address per dispute | snapshot entries are distinct listed addresses | — |
 | Client and freelancer differ | order constructor (Stage 1) | `ClientIsFreelancer` |
 | Fee recipient is not the order itself | order constructor (S1) | `FeeRecipientIsOrder` |
+| `penaltyRecipient` is neither the court nor the registry | registry constructor (S2) | `PenaltyRecipientIsProtocol` |
 
 **Limitation.** These are address checks. Nothing on-chain can detect that different addresses share a controller:
 a party, an arbitrator and `penaltyRecipient` may be the same person behind different addresses.
@@ -293,6 +295,7 @@ interface IArbitratorRegistry {
     function withdrawalsPaid() external view returns (uint256);
     function penaltiesSent() external view returns (uint256);
     function listedCount() external view returns (uint256);
+    function listedAccounts() external view returns (address[] memory);   // listing order; added in S2 for tests
     function accountOf(address arbitrator) external view returns (Account memory);
     function freeStake(address arbitrator) external view returns (uint256);
     function candidatesOf(uint256 disputeId) external view returns (Candidate[] memory);
@@ -561,8 +564,18 @@ caller can choose *which* candidate set is captured, though not the seed it will
 | `resolve` with a panel | 3 seat releases | ≤ 400,000 gas |
 | registry `deposit`, `withdraw` | O(1) plus one swap-and-pop | — |
 
-Targets are acceptance criteria for slices S2–S3, measured with gas snapshots. Snapshot storage is 1 slot per
-candidate per dispute and is not deleted (it serves as history).
+Targets are acceptance criteria for slices S2–S3. Snapshot storage is 1 slot per candidate per dispute and is not
+deleted (it serves as history).
+
+S2 measurements (32 candidates, half of them with matured warming stake that the snapshot materializes; registry and
+harness storage marked cold with `vm.cool`; external call into the court harness, excluding intrinsic and calldata
+cost): `reserveCandidates` 1,580,724, `selectPanel` 245,173, `releaseReservations` 170,399. Meeting the snapshot target
+required packing the account into three slots (`uint128` amounts, `stake` with `reserved`, `warming` with `locked`,
+`warmingUntil` with `listed`); `seatLock` must therefore fit in `uint128`. The `Account` view in section 6.3 keeps
+`uint256` fields. The court-level targets for `openDispute`, `drawPanel` and `resolve` remain for S3.
+
+Selection is implemented in `PanelSelection.selectIndexes(seed, n)`, which reverts with `TooFewCandidates` for
+`n < 3`; the registry takes the seed from the court and never fetches block data.
 
 ### 7.6 Predictability, manipulation and trust
 

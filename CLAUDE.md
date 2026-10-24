@@ -25,7 +25,7 @@ Stage 2 (accepted, `5746ac1`): signed approvals and optional permit funding.
 Stage 3A (accepted, `f0a1c1b`): arbitration design in `docs/stage-3-arbitration-design.md` and
 `docs/stage-3-test-plan.md`. Implementation follows its slices S1–S4, each authorized and reviewed separately.
 
-Stage 3B (current): slice S1 — delivery deadlines, delivery-expiry reclaim credits and claims.
+Stage 3B (accepted, `86e4588`): slice S1 — delivery deadlines, delivery-expiry reclaim credits and claims.
 
 - `deliveryPeriod` (`0 < p <= 180 days`) per order; each milestone's `deliveryDeadline` is set when it becomes
   current; submission requires `block.timestamp < deliveryDeadline`.
@@ -35,8 +35,18 @@ Stage 3B (current): slice S1 — delivery deadlines, delivery-expiry reclaim cre
 - `directPaid` and `claimsPaid` with `fundedTotal == directPaid + claimsPaid + outstandingObligations`.
 - The fee recipient may not be the order itself (`FeeRecipientIsOrder`).
 
-Out of scope until a later stage explicitly asks for it: the arbitration court and registry, disputes,
-voting and their factory or constructor arguments; cancellation by agreement and other refunds; recovery of
+Stage 3C (current): slice S2 — `ArbitratorRegistry`, `IArbitratorRegistry`, `PanelSelection`, and the test-only
+`RegistryCourtHarness`.
+
+- Immutable `court = msg.sender`; `penaltyRecipient` may not be the court or the registry; `seatLock` fits `uint128`.
+- Stake buckets `stake`, `warming`, `reserved`, `locked`; listing minimum `seatLock`; at most 32 listed accounts;
+  automatic delisting below `seatLock`.
+- Court-only snapshots reserve `seatLock` per candidate before any seed; failed snapshots write nothing; stored
+  snapshots never change; `locked + reserved <= stake`.
+- `WorkOrder` and `TrustWorkFactory` are unchanged and do not use the registry.
+
+Out of scope until a later stage explicitly asks for it: the arbitration court, disputes, seed scheduling,
+voting, order or factory integration and their constructor arguments; cancellation by agreement and other refunds; recovery of
 unsolicited tokens, reputation, governance, frontend, deployment scripts (Base Sepolia comes later), and any
 relayer service. Do not add placeholder arbitration functions or hooks.
 

@@ -360,3 +360,55 @@ A slice is accepted only when all of the following are reported from actual comm
 | DI-02 | `invariant_BalanceCoversObligations` |
 | DI-03 | `invariant_ObligationsMatchStatus` |
 | DI-04 | `invariant_ApprovalNonceCountsSettlementsAndTermination` |
+
+## 11. S2 implementation map
+
+Added in S2: R-27 (constructor validation, including `penaltyRecipient` equal to the court or the registry and a
+contract recipient accepted), R-28 (`seatLock` above `uint128`), R-29 (failed outgoing transfers roll back delisting,
+seat state and counters).
+
+| Cases | Test (`test/registry/ArbitratorRegistry.t.sol` unless noted) |
+| --- | --- |
+| R-01 | `test_Deposit_AddsWarmingStakeAndLists`, `test_RevertWhen_DepositZero`, `test_RevertWhen_DepositReceivesInexactAmount` |
+| R-02 | `test_Admission_RequiresListingMinimum`, `test_Admission_DelistedRemainderCanRelist` |
+| R-03 | `test_RevertWhen_RegistryFull`, `test_Capacity_DelistedSlotIsReusableWhenFull` |
+| R-04 | `test_RevertWhen_PenaltyRecipientDeposits` |
+| R-05 | `test_Activation_ExactBoundary` |
+| R-06 | `test_TopUp_RestartsWarmingBucketOnly` |
+| R-07 | `test_Withdraw_TransfersExactAmount`, `test_RevertWhen_WithdrawInvalidAmount` |
+| R-08 | `test_Withdraw_DelistsWithSwapAndPopAndFreesSlot` |
+| R-09 | `test_FullPenalty_RemovesExhaustedAccount` |
+| R-10 | `test_PartialPenalty_KeepsOtherReservation` |
+| R-11 | `test_PenaltyBelowMinimum_DelistsAndRemainderIsWithdrawable` |
+| R-12 | `test_RevertWhen_CourtFunctionsCalledByOthers` |
+| R-13 | `test_Snapshot_StoresEligibleListedAccountsInOrder` |
+| R-14 | `test_RevertWhen_TooFewCandidatesWritesNothing` |
+| R-15 | `test_RevertWhen_SnapshotTakenTwice` |
+| R-16 | `test_Snapshot_UnaffectedByLaterRegistryActivity` |
+| R-17 | `test_RevertWhen_WithdrawingReservedStake` |
+| R-18 | `test_Concurrency_CollateralBacksOneObligationEach` |
+| R-19 | `test_SelectPanel_LocksSelectedAndReleasesOthers`, `test_SelectPanel_CanSelectFirstMiddleAndLastCandidates` |
+| R-20 | `test_RevertWhen_SnapshotStateTransitionRepeated` |
+| R-21 | `test_RevertWhen_ReleaseSeatUnknownOrNotLocked` |
+| R-22 | `test_ReleaseReservations_ReturnsEveryReservation`, `test_ZeroPenaltyRelease_MovesNoTokens` |
+| R-23 | `test_SlotReuse_SnapshotKeepsOriginalIdentities` |
+| R-24 | `ArbitratorRegistry.gas.t.sol`: `test_Gas_SnapshotSelectAndRelease` |
+| R-25 | `test_Donations_CreateNoPrincipal` |
+| R-26 | `test_Reentrancy_DuringDepositWithdrawAndPenaltyIsBlocked` |
+| R-27 | `test_Constructor_StoresTermsAndDeployerIsCourt`, `test_RevertWhen_ConstructorInputsInvalid`, `test_RevertWhen_PenaltyRecipientIsCourt`, `test_RevertWhen_PenaltyRecipientIsRegistry`, `test_Constructor_AcceptsContractPenaltyRecipient` |
+| R-28 | `test_RevertWhen_SeatLockExceedsUint128` |
+| R-29 | `test_RevertWhen_WithdrawTransferFailsRollsBackDelisting`, `test_RevertWhen_PenaltyTransferFailsRollsBackRelease` |
+| M0 | `ArbitratorRegistry.matrix.t.sol`: `test_MatrixM0_SplitStakeGainsSeats` (all 10 triples observed through registry draws), `test_MatrixM0_UnsplitStakeHoldsOneSeat` |
+| RF-01 | `ArbitratorRegistry.fuzz.t.sol`: `testFuzz_MatchesReferenceModel` |
+| RF-02 | `testFuzz_PanelComesFromStoredSnapshot` |
+| RF-03 | `testFuzz_SelectionFrequenciesAreNearUniform`, `test_PanelSelection_RevertWhen_FewerThanThreeCandidates` |
+| RI-01 | `test/invariant/ArbitratorRegistry.invariant.t.sol`: `invariant_CommitmentsNeverExceedStake` |
+| RI-02 | `invariant_CommitmentsMatchLiveCandidacies` |
+| RI-03 | `invariant_TotalStakedIsSumOfPrincipal` |
+| RI-04 | `invariant_CumulativeFlowsBalance` |
+| RI-05 | `invariant_BalanceIsPrincipalPlusDonations` |
+| RI-06 | `invariant_ListingMatchesPrincipal` |
+| RI-07 | `invariant_SnapshotsMatchGhostHistory` |
+
+The registry invariant campaign starts from four funded and activated actors (set up through the handler so the
+ghost model records them); without that seed state, random sequences almost never formed a snapshot.
