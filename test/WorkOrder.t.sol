@@ -6,6 +6,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {WorkOrder} from "../src/WorkOrder.sol";
 import {WorkOrderTestBase} from "./utils/WorkOrderTestBase.sol";
 import {BlocklistToken} from "./mocks/BlocklistToken.sol";
+import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {FeeOnTransferToken} from "./mocks/FeeOnTransferToken.sol";
 import {ReentrantToken} from "./mocks/ReentrantToken.sol";
 
@@ -438,6 +439,32 @@ contract WorkOrderTest is WorkOrderTestBase {
         assertEq(usdc.balanceOf(freelancer), 900 * USDC);
     }
 
+    function test_Fee_FullPrecisionNearUint256Max() public {
+        uint256[3] memory amounts = [type(uint256).max, type(uint256).max - 1, type(uint256).max / 3];
+        uint256[3] memory feeRates = [uint256(1000), 999, 1];
+
+        for (uint256 i; i < amounts.length; ++i) {
+            MockUSDC token = new MockUSDC();
+            uint256[] memory single = new uint256[](1);
+            single[0] = amounts[i];
+            WorkOrder bigOrder = _createOrder(token, feeRates[i], single);
+            _mintAndApprove(token, bigOrder, amounts[i]);
+            vm.prank(client);
+            bigOrder.fund();
+            _submit(bigOrder, 0);
+
+            _approve(bigOrder, 0);
+
+            uint256 expectedFee = _floorFee(amounts[i], feeRates[i]);
+            assertEq(token.balanceOf(feeRecipient), expectedFee);
+            assertEq(token.balanceOf(freelancer), amounts[i] - expectedFee);
+            assertEq(bigOrder.outstandingObligations(), 0);
+            assertEq(token.balanceOf(address(bigOrder)), 0);
+        }
+
+        assertEq(_floorFee(type(uint256).max, 1000), type(uint256).max / 10);
+    }
+
     function test_Donation_BeforeFundingDoesNotBlockFunding() public {
         usdc.mint(address(order), 123 * USDC);
 
@@ -594,5 +621,11 @@ contract WorkOrderTest is WorkOrderTestBase {
         assertEq(token.balanceOf(address(target)), 4000 * USDC);
         assertEq(token.balanceOf(freelancer), 0);
         assertEq(token.balanceOf(feeRecipient), 0);
+    }
+
+    function _floorFee(uint256 amount, uint256 feeBps) private pure returns (uint256) {
+        uint256 quotient = amount / 10_000;
+        uint256 remainder = amount % 10_000;
+        return quotient * feeBps + remainder * feeBps / 10_000;
     }
 }

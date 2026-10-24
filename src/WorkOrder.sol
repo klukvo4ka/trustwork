@@ -2,16 +2,19 @@
 pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 /// @title WorkOrder
 /// @notice Escrow for one client-freelancer engagement paid in ordered milestones.
 /// @dev Only tokens that move exactly the requested amount are supported. Fee-on-transfer tokens are
 /// rejected at funding; rebasing tokens are unsupported and may leave the order unable to settle.
-contract WorkOrder is ReentrancyGuard {
+contract WorkOrder is EIP712, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     enum OrderStatus {
@@ -36,6 +39,8 @@ contract WorkOrder is ReentrancyGuard {
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant MAX_FEE_BPS = 1000;
     uint256 public constant MAX_REVIEW_PERIOD = 30 days;
+    bytes32 public constant APPROVE_MILESTONE_TYPEHASH =
+        keccak256("ApproveMilestone(uint256 milestoneIndex,uint256 nonce,uint256 deadline)");
 
     address public immutable client;
     address public immutable freelancer;
@@ -49,6 +54,8 @@ contract WorkOrder is ReentrancyGuard {
     uint256 public currentMilestone;
     /// @notice Funded milestone amounts not yet settled. Independent of the raw token balance.
     uint256 public outstandingObligations;
+    /// @notice Nonce a client approval signature must carry. Incremented by every settlement, however it happens.
+    uint256 public approvalNonce;
 
     Milestone[] private _milestones;
 
@@ -56,6 +63,9 @@ contract WorkOrder is ReentrancyGuard {
     event MilestoneSubmitted(uint256 indexed index, uint256 reviewDeadline);
     event MilestoneSettled(
         uint256 indexed index, address indexed settledBy, bool byTimeout, uint256 freelancerPayout, uint256 fee
+    );
+    event MilestoneApprovedBySignature(
+        uint256 indexed index, address indexed client, address indexed relayer, uint256 nonce
     );
     event OrderCompleted();
 
@@ -73,6 +83,9 @@ contract WorkOrder is ReentrancyGuard {
     error InvalidMilestoneStatus(uint256 index, MilestoneStatus status);
     error ReviewPeriodNotElapsed(uint256 index, uint256 reviewDeadline);
     error DepositMismatch(uint256 expected, uint256 received);
+    error ApprovalSignatureExpired(uint256 deadline);
+    error InvalidApprovalNonce(uint256 nonce, uint256 approvalNonce);
+    error InvalidApprovalSignature();
 
     constructor(
         address client_,
@@ -82,7 +95,7 @@ contract WorkOrder is ReentrancyGuard {
         uint256 feeBps_,
         uint256 reviewPeriod_,
         uint256[] memory milestoneAmounts
-    ) {
+    ) EIP712("TrustWork", "1") {
         if (
             client_ == address(0) || freelancer_ == address(0) || feeRecipient_ == address(0)
                 || address(token_) == address(0)
@@ -117,18 +130,18 @@ contract WorkOrder is ReentrancyGuard {
     /// @dev Reverts unless the order's balance grows by exactly `totalAmount`, which rejects
     /// fee-on-transfer tokens. Tokens already held by the order do not affect the check.
     function fund() external nonReentrant {
-        if (msg.sender != client) revert NotClient(msg.sender);
-        if (status != OrderStatus.Unfunded) revert InvalidOrderStatus(status);
+        _requireFundable();
+        _deposit();
+    }
 
-        status = OrderStatus.Active;
-        outstandingObligations = totalAmount;
-
-        uint256 balanceBefore = token.balanceOf(address(this));
-        token.safeTransferFrom(msg.sender, address(this), totalAmount);
-        uint256 received = token.balanceOf(address(this)) - balanceBefore;
-        if (received != totalAmount) revert DepositMismatch(totalAmount, received);
-
-        emit Funded(msg.sender, totalAmount);
+    /// @notice Funds the order after attempting an ERC-2612 permit for exactly `totalAmount` from the client.
+    /// @dev The permit is best effort: if it reverts (invalid, expired, already used, or unsupported by the
+    /// token), funding proceeds and succeeds only if the client's existing allowance covers `totalAmount`.
+    /// A failed permit never authorizes a transfer on its own.
+    function fundWithPermit(uint256 deadline, uint8 v, bytes32 r, bytes32 s) external nonReentrant {
+        _requireFundable();
+        try IERC20Permit(address(token)).permit(client, address(this), totalAmount, deadline, v, r, s) {} catch {}
+        _deposit();
     }
 
     /// @notice Marks the current milestone as delivered and starts its review period.
@@ -161,6 +174,30 @@ contract WorkOrder is ReentrancyGuard {
         _settle(index, milestone, true);
     }
 
+    /// @notice Settles the submitted current milestone using the client's EIP-712 approval. Callable by any relayer,
+    /// who pays the gas. Contract clients are verified through ERC-1271.
+    /// @dev The signature is accepted while `block.timestamp <= deadline`; this deadline is unrelated to the
+    /// milestone's review deadline.
+    function approveMilestoneBySignature(uint256 index, uint256 nonce, uint256 deadline, bytes calldata signature)
+        external
+        nonReentrant
+    {
+        Milestone storage milestone = _currentMilestone(index, MilestoneStatus.Submitted);
+        if (block.timestamp > deadline) revert ApprovalSignatureExpired(deadline);
+        if (nonce != approvalNonce) revert InvalidApprovalNonce(nonce, approvalNonce);
+        if (!SignatureChecker.isValidSignatureNowCalldata(client, approvalDigest(index, nonce, deadline), signature)) {
+            revert InvalidApprovalSignature();
+        }
+
+        emit MilestoneApprovedBySignature(index, client, msg.sender, nonce);
+        _settle(index, milestone, false);
+    }
+
+    /// @notice EIP-712 digest the client signs to approve `index` with `nonce` until `deadline`.
+    function approvalDigest(uint256 index, uint256 nonce, uint256 deadline) public view returns (bytes32) {
+        return _hashTypedDataV4(keccak256(abi.encode(APPROVE_MILESTONE_TYPEHASH, index, nonce, deadline)));
+    }
+
     function milestoneCount() external view returns (uint256) {
         return _milestones.length;
     }
@@ -172,6 +209,23 @@ contract WorkOrder is ReentrancyGuard {
     /// @notice Fee withheld from a milestone payment, rounded down in the freelancer's favor.
     function feeFor(uint256 amount) public view returns (uint256) {
         return Math.mulDiv(amount, feeBps, BPS_DENOMINATOR);
+    }
+
+    function _requireFundable() private view {
+        if (msg.sender != client) revert NotClient(msg.sender);
+        if (status != OrderStatus.Unfunded) revert InvalidOrderStatus(status);
+    }
+
+    function _deposit() private {
+        status = OrderStatus.Active;
+        outstandingObligations = totalAmount;
+
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(client, address(this), totalAmount);
+        uint256 received = token.balanceOf(address(this)) - balanceBefore;
+        if (received != totalAmount) revert DepositMismatch(totalAmount, received);
+
+        emit Funded(client, totalAmount);
     }
 
     function _currentMilestone(uint256 index, MilestoneStatus expected) private view returns (Milestone storage) {
@@ -189,6 +243,7 @@ contract WorkOrder is ReentrancyGuard {
 
         milestone.status = MilestoneStatus.Settled;
         outstandingObligations -= amount;
+        ++approvalNonce;
         currentMilestone = index + 1;
         bool completed = index + 1 == _milestones.length;
         if (completed) status = OrderStatus.Completed;

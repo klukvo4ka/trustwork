@@ -3,30 +3,65 @@ pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {WorkOrder} from "../../src/WorkOrder.sol";
-import {MockUSDC} from "../mocks/MockUSDC.sol";
+import {MockPermitUSDC} from "../mocks/MockPermitUSDC.sol";
 
 contract WorkOrderHandler is Test {
+    bytes32 private constant APPROVE_MILESTONE_TYPEHASH =
+        keccak256("ApproveMilestone(uint256 milestoneIndex,uint256 nonce,uint256 deadline)");
+    bytes32 private constant PERMIT_TYPEHASH =
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+
     WorkOrder public immutable order;
-    MockUSDC public immutable usdc;
+    MockPermitUSDC public immutable token;
+    uint256 private immutable clientKey;
 
     uint256 public settledTotal;
     uint256 public donatedTotal;
-    uint256 public settlementCount;
+    uint256 public donatedBeforeFunding;
 
-    constructor(WorkOrder order_, MockUSDC usdc_) {
+    uint256 public fundedDirectly;
+    uint256 public fundedWithPermit;
+    uint256 public fundedByPermitFallback;
+    uint256 public settledByClient;
+    uint256 public settledBySignature;
+    uint256 public settledByTimeout;
+    uint256 public rejectedStaleSignatures;
+
+    constructor(WorkOrder order_, MockPermitUSDC token_, uint256 clientKey_) {
         order = order_;
-        usdc = usdc_;
+        token = token_;
+        clientKey = clientKey_;
     }
 
-    function fund() external {
+    function fund(uint256 path) external {
         if (order.status() != WorkOrder.OrderStatus.Unfunded) return;
-        uint256 total = order.totalAmount();
         address client = order.client();
-        usdc.mint(client, total);
-        vm.startPrank(client);
-        usdc.approve(address(order), total);
-        order.fund();
-        vm.stopPrank();
+        uint256 total = order.totalAmount();
+        uint256 deadline = block.timestamp + 1 hours;
+        token.mint(client, total);
+
+        path %= 3;
+        if (path == 0) {
+            vm.startPrank(client);
+            token.approve(address(order), total);
+            order.fund();
+            vm.stopPrank();
+            ++fundedDirectly;
+        } else if (path == 1) {
+            bytes32 structHash =
+                keccak256(abi.encode(PERMIT_TYPEHASH, client, address(order), total, token.nonces(client), deadline));
+            (uint8 v, bytes32 r, bytes32 s) =
+                vm.sign(clientKey, keccak256(abi.encodePacked(hex"1901", token.DOMAIN_SEPARATOR(), structHash)));
+            vm.prank(client);
+            order.fundWithPermit(deadline, v, r, s);
+            ++fundedWithPermit;
+        } else {
+            vm.startPrank(client);
+            token.approve(address(order), total);
+            order.fundWithPermit(deadline, 27, bytes32(0), bytes32(0));
+            vm.stopPrank();
+            ++fundedByPermitFallback;
+        }
     }
 
     function submit() external {
@@ -41,10 +76,34 @@ contract WorkOrderHandler is Test {
         if (!_currentIs(WorkOrder.MilestoneStatus.Submitted)) return;
         uint256 index = order.currentMilestone();
         settledTotal += order.getMilestone(index).amount;
-        ++settlementCount;
+        ++settledByClient;
         address client = order.client();
         vm.prank(client);
         order.approveMilestone(index);
+    }
+
+    function approveBySignature(address relayer, uint256 validity) external {
+        if (!_currentIs(WorkOrder.MilestoneStatus.Submitted)) return;
+        uint256 index = order.currentMilestone();
+        uint256 nonce = order.approvalNonce();
+        uint256 deadline = block.timestamp + bound(validity, 0, 30 days);
+        bytes memory signature = _signApproval(index, nonce, deadline);
+        settledTotal += order.getMilestone(index).amount;
+        ++settledBySignature;
+        vm.prank(relayer);
+        order.approveMilestoneBySignature(index, nonce, deadline, signature);
+    }
+
+    function replayStaleSignature(address relayer) external {
+        uint256 nonce = order.approvalNonce();
+        if (nonce == 0 || !_currentIs(WorkOrder.MilestoneStatus.Submitted)) return;
+        uint256 index = order.currentMilestone();
+        uint256 deadline = block.timestamp;
+        bytes memory signature = _signApproval(index, nonce - 1, deadline);
+        vm.expectRevert(abi.encodeWithSelector(WorkOrder.InvalidApprovalNonce.selector, nonce - 1, nonce));
+        vm.prank(relayer);
+        order.approveMilestoneBySignature(index, nonce - 1, deadline, signature);
+        ++rejectedStaleSignatures;
     }
 
     function finalize(address caller) external {
@@ -53,7 +112,7 @@ contract WorkOrderHandler is Test {
         WorkOrder.Milestone memory milestone = order.getMilestone(index);
         if (block.timestamp < milestone.reviewDeadline) return;
         settledTotal += milestone.amount;
-        ++settlementCount;
+        ++settledByTimeout;
         vm.prank(caller);
         order.finalizeMilestone(index);
     }
@@ -65,7 +124,32 @@ contract WorkOrderHandler is Test {
     function donate(uint256 amount) external {
         amount = bound(amount, 0, 1e9 * 1e6);
         donatedTotal += amount;
-        usdc.mint(address(order), amount);
+        if (order.status() == WorkOrder.OrderStatus.Unfunded) donatedBeforeFunding += amount;
+        token.mint(address(order), amount);
+    }
+
+    function settlementCount() external view returns (uint256) {
+        return settledByClient + settledBySignature + settledByTimeout;
+    }
+
+    function fundingCount() external view returns (uint256) {
+        return fundedDirectly + fundedWithPermit + fundedByPermitFallback;
+    }
+
+    function _signApproval(uint256 index, uint256 nonce, uint256 deadline) private view returns (bytes memory) {
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("TrustWork")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(order)
+            )
+        );
+        bytes32 structHash = keccak256(abi.encode(APPROVE_MILESTONE_TYPEHASH, index, nonce, deadline));
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(clientKey, keccak256(abi.encodePacked(hex"1901", domainSeparator, structHash)));
+        return abi.encodePacked(r, s, v);
     }
 
     function _currentIs(WorkOrder.MilestoneStatus expected) private view returns (bool) {

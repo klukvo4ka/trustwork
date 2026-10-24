@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {WorkOrder} from "../src/WorkOrder.sol";
 import {WorkOrderTestBase} from "./utils/WorkOrderTestBase.sol";
+import {MockPermitUSDC} from "./mocks/MockPermitUSDC.sol";
 
 contract WorkOrderFuzzTest is WorkOrderTestBase {
     uint256 internal constant MAX_MILESTONES = 12;
@@ -111,6 +112,83 @@ contract WorkOrderFuzzTest is WorkOrderTestBase {
         assertEq(order.outstandingObligations(), 0);
         assertEq(usdc.balanceOf(address(order)), donation);
         assertEq(uint256(order.status()), uint256(WorkOrder.OrderStatus.Completed));
+    }
+
+    function testFuzz_LifecycleAcrossFundingAndSettlementPaths(
+        uint256[] memory rawAmounts,
+        uint256 feeBps,
+        uint256 donation,
+        uint8 fundingPath,
+        uint256 settlementPaths,
+        address relayer
+    ) public {
+        vm.assume(rawAmounts.length > 0);
+        uint256[] memory amounts = _boundAmounts(rawAmounts);
+        feeBps = bound(feeBps, 0, 1000);
+        donation = bound(donation, 0, MAX_MILESTONE_AMOUNT);
+        MockPermitUSDC token = new MockPermitUSDC();
+        WorkOrder order = _createOrder(token, feeBps, amounts);
+        uint256 total = order.totalAmount();
+        token.mint(address(order), donation);
+        token.mint(client, total);
+
+        _fundThroughPath(order, token, fundingPath % 3);
+
+        assertEq(order.outstandingObligations(), total);
+        assertEq(token.balanceOf(address(order)), total + donation);
+        assertEq(token.allowance(client, address(order)), 0);
+
+        uint256 unsettled = total;
+        uint256 expectedFees;
+        for (uint256 i; i < amounts.length; ++i) {
+            _submit(order, i);
+            uint256 path = (settlementPaths >> (2 * i)) % 3;
+            if (path == 0) {
+                _approve(order, i);
+            } else if (path == 1) {
+                uint256 signatureDeadline = block.timestamp;
+                bytes memory signature = _signApproval(clientKey, order, i, i, signatureDeadline);
+                vm.prank(relayer);
+                order.approveMilestoneBySignature(i, i, signatureDeadline, signature);
+            } else {
+                vm.warp(order.getMilestone(i).reviewDeadline);
+                vm.prank(relayer);
+                order.finalizeMilestone(i);
+            }
+
+            unsettled -= amounts[i];
+            expectedFees += amounts[i] * feeBps / 10_000;
+            assertEq(order.approvalNonce(), i + 1);
+            assertEq(order.currentMilestone(), i + 1);
+            assertEq(order.outstandingObligations(), unsettled);
+            assertEq(token.balanceOf(address(order)), unsettled + donation);
+            assertEq(token.balanceOf(feeRecipient), expectedFees);
+        }
+
+        assertEq(token.balanceOf(freelancer), total - expectedFees);
+        assertEq(uint256(order.status()), uint256(WorkOrder.OrderStatus.Completed));
+    }
+
+    function _fundThroughPath(WorkOrder order, MockPermitUSDC token, uint256 path) private {
+        uint256 total = order.totalAmount();
+        uint256 deadline = block.timestamp + 1 hours;
+        if (path == 0) {
+            vm.startPrank(client);
+            token.approve(address(order), total);
+            order.fund();
+            vm.stopPrank();
+        } else if (path == 1) {
+            (uint8 v, bytes32 r, bytes32 s) = _signPermit(clientKey, token, address(order), total, 0, deadline);
+            vm.prank(client);
+            order.fundWithPermit(deadline, v, r, s);
+            assertEq(token.nonces(client), 1);
+        } else {
+            vm.startPrank(client);
+            token.approve(address(order), total);
+            order.fundWithPermit(deadline, 27, bytes32(0), bytes32(0));
+            vm.stopPrank();
+            assertEq(token.nonces(client), 0);
+        }
     }
 
     function _boundAmounts(uint256[] memory rawAmounts) private pure returns (uint256[] memory amounts) {

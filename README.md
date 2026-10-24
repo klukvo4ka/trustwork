@@ -2,7 +2,7 @@
 
 Milestone-based escrow for freelance work, written in Solidity with Foundry and OpenZeppelin Contracts v5.
 
-> **Status:** Stage 1 of a portfolio project. Unaudited and intended for local development and testnets only.
+> **Status:** Stage 2 of a portfolio project. Unaudited and intended for local development and testnets only.
 > Do not use it with real funds.
 
 ## Architecture
@@ -45,13 +45,16 @@ Unfunded --fund()--> Active --(last milestone settled)--> Completed
 Milestone: Pending --submitMilestone()--> Submitted --approveMilestone() | finalizeMilestone()--> Settled
 ```
 
-1. **Fund** — only the client, once, for exactly `totalAmount`. Requires a prior ERC-20 approval.
+1. **Fund** — only the client, once, for exactly `totalAmount`, through `fund()` (prior ERC-20 approval) or
+   `fundWithPermit()` (ERC-2612 permit, see [Permit funding](#permit-funding)).
 2. **Submit** — only the freelancer, for the current milestone, after funding. Records `submittedAt` and
    `reviewDeadline = block.timestamp + reviewPeriod`.
-3. **Approve** — only the client, for the current submitted milestone, at any time after submission
-   (including after the deadline).
+3. **Approve** — for the current submitted milestone, at any time after submission (including after the
+   review deadline): directly by the client with `approveMilestone()`, or by anyone relaying the client's
+   signature with `approveMilestoneBySignature()` (see [Signed approvals](#signed-approvals)).
 4. **Finalize** — anyone, for the current submitted milestone, once `block.timestamp >= reviewDeadline`.
-5. Settlement marks the milestone `Settled`, advances `currentMilestone`, and pays out. Settling the last
+5. Settlement marks the milestone `Settled`, increments `approvalNonce`, advances `currentMilestone`, and pays
+   out. Settling the last
    milestone sets the order to `Completed`.
 
 Every function that targets a milestone takes its index and requires it to equal `currentMilestone`. Milestones are
@@ -66,6 +69,133 @@ eligible  <=>  block.timestamp >= reviewDeadline
 ```
 
 At `reviewDeadline - 1` finalization reverts with `ReviewPeriodNotElapsed`; at `reviewDeadline` it succeeds.
+
+## Signed approvals
+
+`approveMilestoneBySignature(index, nonce, deadline, signature)` settles a milestone with an EIP-712 signature from
+the client. Any account may submit it; the submitter (relayer) pays the transaction gas and receives nothing from the
+order. Settlement is identical to `approveMilestone()`: same checks on order and milestone state, same fee
+calculation, same payouts.
+
+### Domain and message
+
+| Domain field        | Value                     |
+| ------------------- | ------------------------- |
+| `name`              | `TrustWork`               |
+| `version`           | `1`                       |
+| `chainId`           | current `block.chainid`   |
+| `verifyingContract` | the `WorkOrder` address   |
+
+```
+ApproveMilestone(uint256 milestoneIndex,uint256 nonce,uint256 deadline)
+```
+
+Example `eth_signTypedData_v4` payload for milestone `0` on Base Sepolia. The `verifyingContract` is a
+placeholder; use the address of the order being approved.
+
+```json
+{
+  "types": {
+    "EIP712Domain": [
+      { "name": "name", "type": "string" },
+      { "name": "version", "type": "string" },
+      { "name": "chainId", "type": "uint256" },
+      { "name": "verifyingContract", "type": "address" }
+    ],
+    "ApproveMilestone": [
+      { "name": "milestoneIndex", "type": "uint256" },
+      { "name": "nonce", "type": "uint256" },
+      { "name": "deadline", "type": "uint256" }
+    ]
+  },
+  "primaryType": "ApproveMilestone",
+  "domain": {
+    "name": "TrustWork",
+    "version": "1",
+    "chainId": 84532,
+    "verifyingContract": "0x1111111111111111111111111111111111111111"
+  },
+  "message": {
+    "milestoneIndex": 0,
+    "nonce": 0,
+    "deadline": 1767225600
+  }
+}
+```
+
+`approvalDigest(index, nonce, deadline)` returns the digest the client must sign, and `eip712Domain()` (ERC-5267)
+returns the domain. The test suite builds the digest independently and checks it against both.
+
+### Validation order
+
+The call reverts, leaving all state including `approvalNonce` unchanged, unless:
+
+1. the order is `Active` (`InvalidOrderStatus`);
+2. `index` is the current milestone (`NotCurrentMilestone`) and it is `Submitted` (`InvalidMilestoneStatus`);
+3. `block.timestamp <= deadline` (`ApprovalSignatureExpired`);
+4. `nonce == approvalNonce` (`InvalidApprovalNonce`);
+5. the signature is valid for the immutable `client` (`InvalidApprovalSignature`).
+
+A payout failure after validation reverts the whole transaction, so the nonce is not consumed and the same signature
+can be submitted again once the transfer can succeed.
+
+### Nonces and replay protection
+
+`approvalNonce` is a single order-wide counter that starts at `0` and increases by exactly one on every successful
+settlement, whether it came from `approveMilestone`, `approveMilestoneBySignature` or `finalizeMilestone`. After
+`k` settlements it equals `k` and equals `currentMilestone`, so the signature for milestone `i` must carry
+nonce `i`.
+
+- **Same milestone twice:** after settlement the milestone is no longer current and the nonce has moved on.
+- **Another milestone:** the index is part of the signed message.
+- **Outstanding signatures:** a direct approval or a timeout consumes the nonce, invalidating any unused signature
+  issued for it.
+- **Another order or chain:** the domain separator includes `verifyingContract` and `chainId`; OpenZeppelin's
+  `EIP712` recomputes it if the chain id changes after a fork.
+
+### Signature expiry vs. review deadline
+
+The two deadlines are independent:
+
+- **Signature `deadline`** — chosen by the client, inclusive (`block.timestamp <= deadline`). It only limits how long
+  the signature can be relayed.
+- **Milestone `reviewDeadline`** — fixed at submission. Reaching it lets anyone call `finalizeMilestone`, but it does
+  not invalidate a signature: a signed approval can still be relayed after the review deadline, as long as the
+  signature has not expired and the milestone has not been finalized.
+
+### Contract clients (ERC-1271)
+
+Signatures are checked with OpenZeppelin `SignatureChecker`. If the client address has no code, the signature must
+be a 65-byte ECDSA signature with low `s` from that address. If the client is a contract, the order calls
+`isValidSignature(digest, signature)` with `staticcall` and requires the ERC-1271 magic value; a wrong return value
+or a reverting validator is treated as an invalid signature. Contract signatures are revocable: validity is whatever
+the wallet reports at execution time.
+
+ERC-1271 applies only to milestone approvals. Permit funding depends on the token's own `permit` implementation,
+which for most ERC-2612 tokens accepts only ECDSA signatures from EOAs.
+
+## Permit funding
+
+`fundWithPermit(deadline, v, r, s)` lets the client approve and fund in one transaction on tokens that implement
+ERC-2612. The permit terms are fixed: owner `client`, spender the order, value `totalAmount`. There are no
+caller-supplied owner, spender, recipient or amount parameters.
+
+1. The caller must be the client and the order must be `Unfunded`; otherwise it reverts before calling the token,
+   and the permit is not consumed.
+2. `permit` is called inside `try/catch`. A revert for any reason (expired, wrong signer, wrong value, nonce
+   already used, or no `permit` function on the token) is ignored.
+3. The same deposit logic as `fund()` runs: `transferFrom(client, order, totalAmount)` followed by the exact balance
+   check.
+
+A failed permit therefore never authorizes funding by itself. Funding succeeds after a failed permit only if the
+client's existing allowance already covers `totalAmount`; otherwise the transfer reverts with the token's
+insufficient-allowance error. This also defuses permit front-running: if someone submits the client's permit to the
+token first, the allowance it created is used and funding still succeeds. Any revert after the permit, such as an
+insufficient balance, rolls the permit back with the rest of the transaction.
+
+`fund()` remains for tokens and wallets without ERC-2612 support. The permit tests use OpenZeppelin's `ERC20Permit`
+in a mock; they do not demonstrate compatibility with any deployed USDC contract, whose permit domain and behavior
+must be checked separately.
 
 ## Fees
 
@@ -108,12 +238,14 @@ target).
 
 ## Security notes
 
-- `SafeERC20` for every transfer; `ReentrancyGuard` on `fund`, `submitMilestone`, `approveMilestone` and
-  `finalizeMilestone`.
+- `SafeERC20` for every transfer; `ReentrancyGuard` on `fund`, `fundWithPermit`, `submitMilestone`,
+  `approveMilestone`, `approveMilestoneBySignature` and `finalizeMilestone`.
 - Checks-effects-interactions: status, obligations and milestone index are updated before tokens move. Funding
   additionally checks the received amount after the transfer.
 - Custom errors for all failures; events `Funded`, `MilestoneSubmitted`, `MilestoneSettled` and `OrderCompleted`
-  for every lifecycle change.
+  for every lifecycle change. A signed approval additionally emits
+  `MilestoneApprovedBySignature(index, client, relayer, nonce)` before `MilestoneSettled`, whose `settledBy` is the
+  relayer.
 - Timestamps are stored as `uint64` via `SafeCast`.
 
 ## Development
@@ -129,10 +261,15 @@ forge test
 forge coverage
 ```
 
-Tests are split into unit tests (`test/TrustWorkFactory.t.sol`, `test/WorkOrder.t.sol`), fuzz tests
-(`test/WorkOrder.fuzz.t.sol`) and a stateful invariant suite (`test/invariant/`). Token mocks under `test/mocks/`
-are test-only: `MockUSDC` (6 decimals, open minting), a fee-on-transfer token, a blocklist token, and a token that
-re-enters the order during transfers.
+Tests are split into unit tests (`test/TrustWorkFactory.t.sol`, `test/WorkOrder.t.sol`,
+`test/WorkOrder.signature.t.sol`, `test/WorkOrder.permit.t.sol`), fuzz tests (`test/WorkOrder.fuzz.t.sol`) and a
+stateful invariant suite (`test/invariant/`) that mixes all funding and settlement paths. Mocks under `test/mocks/`
+are test-only: `MockUSDC` (6 decimals, open minting), `MockPermitUSDC` (adds ERC-2612), a fee-on-transfer token, a
+blocklist token, a token that re-enters the order during transfers, and an ERC-1271 wallet that can be switched to
+return a wrong magic value or revert.
+
+Run `forge test --match-path 'test/invariant/*' -vv` to print a per-campaign summary of the transitions reached in
+the final run (funding path, settlement paths, rejected stale signatures).
 
 ## Current limitations
 
@@ -141,6 +278,13 @@ Not implemented in this stage:
 - cancellation, refunds, and any way for the client to recover funds;
 - disputes and arbitration — a submitted milestone is either approved or auto-released after the review period;
 - recovery of unsolicited tokens sent directly to an order;
-- signed approvals, `permit`, reputation, governance, frontend, and deployment scripts.
+- reputation, governance, frontend, deployment scripts, and a relayer service.
+
+Stage 2 caveats:
+
+- The client cannot revoke a signed approval except by letting it expire or by settling the milestone some other
+  way (direct approval, or waiting for the timeout); there is no nonce-cancel function.
+- `fundWithPermit` treats a token whose fallback accepts the `permit` call without reverting the same as a
+  successful permit; funding still requires the resulting allowance.
 
 The milestone count has no explicit cap; creation gas grows linearly with it and is paid by the client.

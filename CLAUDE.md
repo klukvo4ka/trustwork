@@ -6,16 +6,25 @@ Milestone-based freelance escrow. Portfolio project, unaudited, testnet-oriented
 
 The project is built in stages. Each stage is implemented only after the previous one is reviewed.
 
-Stage 1 (current): escrow core.
+Stage 1 (accepted, `3440319`): escrow core.
 
 - `TrustWorkFactory` deploys independent `WorkOrder` contracts; the caller becomes the client.
 - `WorkOrder` holds the full milestone budget, settles milestones strictly in order on client
   approval or after the review deadline, and pays the fee recipient and freelancer.
 - Test-only token mocks, Foundry unit, fuzz and invariant tests, README.
 
-Out of scope until a later stage explicitly asks for it: signatures, permit, arbitration,
-disputes, cancellation, refunds, recovery of unsolicited tokens, reputation, governance,
-frontend, and deployment scripts (Base Sepolia comes later).
+Stage 2 (current): signed approvals and optional permit funding.
+
+- `approveMilestoneBySignature`: any relayer submits the client's EIP-712 approval
+  (`ApproveMilestone(uint256 milestoneIndex,uint256 nonce,uint256 deadline)`, domain `TrustWork` / `1`).
+  EOA and ERC-1271 clients via `SignatureChecker`. Order-wide `approvalNonce` increments on every settlement.
+- `fundWithPermit`: client-only, best-effort ERC-2612 permit for fixed terms (client, this order,
+  `totalAmount`), then the same deposit logic as `fund()`.
+- Stage 1 behavior, accounting, access control and deadline boundaries are unchanged.
+
+Out of scope until a later stage explicitly asks for it: arbitration, disputes, cancellation, refunds,
+recovery of unsolicited tokens, reputation, governance, frontend, deployment scripts (Base Sepolia
+comes later), and any relayer service.
 
 ## Toolchain
 
@@ -41,7 +50,11 @@ frontend, and deployment scripts (Base Sepolia comes later).
 - Token transfers go through `SafeERC20`.
 - State-changing entry points that move tokens are `nonReentrant`.
 - Checks-effects-interactions: validate, update state, then transfer.
-- Funding verifies the actual balance increase equals the required deposit.
+- Funding verifies the actual balance increase equals the required deposit, on every funding path.
+- Permit calls are wrapped in try/catch and never replace the allowance check; caller and order state
+  are validated before the token is called.
+- Signatures are bound to the domain (chain id, order address), the milestone index, the nonce and an
+  expiry; any settlement consumes the current nonce. Failed validation or payout leaves the nonce unchanged.
 - Escrow obligations are tracked in storage (`outstandingObligations`), never inferred from the raw
   token balance; unsolicited transfers must not block funding or settlement.
 - Each milestone settles at most once; settlement advances the order.
