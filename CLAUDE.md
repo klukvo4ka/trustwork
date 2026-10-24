@@ -13,7 +13,7 @@ Stage 1 (accepted, `3440319`): escrow core.
   approval or after the review deadline, and pays the fee recipient and freelancer.
 - Test-only token mocks, Foundry unit, fuzz and invariant tests, README.
 
-Stage 2 (current): signed approvals and optional permit funding.
+Stage 2 (accepted, `5746ac1`): signed approvals and optional permit funding.
 
 - `approveMilestoneBySignature`: any relayer submits the client's EIP-712 approval
   (`ApproveMilestone(uint256 milestoneIndex,uint256 nonce,uint256 deadline)`, domain `TrustWork` / `1`).
@@ -22,9 +22,15 @@ Stage 2 (current): signed approvals and optional permit funding.
   `totalAmount`), then the same deposit logic as `fund()`.
 - Stage 1 behavior, accounting, access control and deadline boundaries are unchanged.
 
-Out of scope until a later stage explicitly asks for it: arbitration, disputes, cancellation, refunds,
-recovery of unsolicited tokens, reputation, governance, frontend, deployment scripts (Base Sepolia
-comes later), and any relayer service.
+Stage 3A (current): arbitration design only.
+
+- Deliverables: `docs/stage-3-arbitration-design.md` and `docs/stage-3-test-plan.md`.
+- No changes to contracts, tests, dependencies or compiler settings. Implementation follows the slices
+  in the design document (S1–S4), each authorized and reviewed separately.
+
+Out of scope until a later stage explicitly asks for it: implementing arbitration, disputes, delivery
+deadlines, cancellation or refunds; recovery of unsolicited tokens, reputation, governance, frontend,
+deployment scripts (Base Sepolia comes later), and any relayer service.
 
 ## Toolchain
 

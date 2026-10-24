@@ -90,8 +90,9 @@ calculation, same payouts.
 ApproveMilestone(uint256 milestoneIndex,uint256 nonce,uint256 deadline)
 ```
 
-Example `eth_signTypedData_v4` payload for milestone `0` on Base Sepolia. The `verifyingContract` is a
-placeholder; use the address of the order being approved.
+Example `eth_signTypedData_v4` payload for milestone `0` on Base Sepolia. All values are illustrative: replace
+`verifyingContract` with the address of the order being approved, and `deadline` with a future Unix timestamp
+(`1767225600` is 2026-01-01 00:00:00 UTC, so a signature with it would already be expired).
 
 ```json
 {
