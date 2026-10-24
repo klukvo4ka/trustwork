@@ -9,7 +9,12 @@ import {WorkOrder} from "./WorkOrder.sol";
 /// @dev Input validation is enforced by the WorkOrder constructor, so its custom errors bubble up from here.
 contract TrustWorkFactory {
     event WorkOrderCreated(
-        address indexed order, address indexed client, address indexed freelancer, address token, uint256 totalAmount
+        address indexed order,
+        address indexed client,
+        address indexed freelancer,
+        address token,
+        uint256 totalAmount,
+        uint256 deliveryPeriod
     );
 
     function createWorkOrder(
@@ -18,9 +23,14 @@ contract TrustWorkFactory {
         address feeRecipient,
         uint256 feeBps,
         uint256 reviewPeriod,
+        uint256 deliveryPeriod,
         uint256[] calldata milestoneAmounts
     ) external returns (WorkOrder order) {
-        order = new WorkOrder(msg.sender, freelancer, token, feeRecipient, feeBps, reviewPeriod, milestoneAmounts);
-        emit WorkOrderCreated(address(order), msg.sender, freelancer, address(token), order.totalAmount());
+        order = new WorkOrder(
+            msg.sender, freelancer, token, feeRecipient, feeBps, reviewPeriod, deliveryPeriod, milestoneAmounts
+        );
+        emit WorkOrderCreated(
+            address(order), msg.sender, freelancer, address(token), order.totalAmount(), deliveryPeriod
+        );
     }
 }

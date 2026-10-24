@@ -2,7 +2,7 @@
 
 Milestone-based escrow for freelance work, written in Solidity with Foundry and OpenZeppelin Contracts v5.
 
-> **Status:** Stage 2 of a portfolio project. Unaudited and intended for local development and testnets only.
+> **Status:** Stage 3B (delivery expiry and claims) of a portfolio project. Unaudited and intended for local development and testnets only.
 > Do not use it with real funds.
 
 ## Architecture
@@ -13,10 +13,10 @@ Milestone-based escrow for freelance work, written in Solidity with Foundry and 
 | `WorkOrder`        | Holds one engagement's budget and releases it milestone by milestone.                  |
 
 Each order is its own contract, so funds and state of different engagements never mix. There is no owner, admin,
-upgrade path, or pause switch, and no function that can move escrowed tokens anywhere other than the fee recipient
-and the freelancer.
+upgrade path, or pause switch. Escrowed tokens leave an order only through settlement (to the fee recipient and the
+freelancer) or through `claimPayout` of a credit recorded at termination.
 
-Order terms (client, freelancer, token, fee recipient, fee, review period, total) are immutables. Milestone amounts
+Order terms (client, freelancer, token, fee recipient, fee, review period, delivery period, total) are immutables. Milestone amounts
 live in a storage array because Solidity has no immutable arrays; nothing writes to an amount after construction.
 
 The factory forwards all terms to the `WorkOrder` constructor, which performs the validation. A `WorkOrder` deployed
@@ -34,28 +34,39 @@ orders created through TrustWork.
 | Every milestone amount is positive                        | `ZeroMilestoneAmount`    |
 | `feeBps <= 1000` (10%)                                    | `FeeTooHigh`             |
 | `0 < reviewPeriod <= 30 days`                             | `InvalidReviewPeriod`    |
+| `0 < deliveryPeriod <= 180 days`                          | `InvalidDeliveryPeriod`  |
+| Fee recipient is not the order itself                     | `FeeRecipientIsOrder`    |
 
 A milestone list whose sum overflows `uint256` reverts with a checked-arithmetic panic.
+
+The fee recipient may equal the client or the freelancer, and may be a contract. It may not be the order's own
+address: an ERC-20 transfer to oneself does not reduce the balance, so the fee would stay locked in the order while
+the accounting records it as paid.
 
 ## Lifecycle
 
 ```
 Unfunded --fund()--> Active --(last milestone settled)--> Completed
+                       |
+                       +--reclaimAfterDeliveryExpiry()--> Terminated --claimPayout()--> (credits paid)
 
 Milestone: Pending --submitMilestone()--> Submitted --approveMilestone() | finalizeMilestone()--> Settled
 ```
 
 1. **Fund** — only the client, once, for exactly `totalAmount`, through `fund()` (prior ERC-20 approval) or
-   `fundWithPermit()` (ERC-2612 permit, see [Permit funding](#permit-funding)).
-2. **Submit** — only the freelancer, for the current milestone, after funding. Records `submittedAt` and
-   `reviewDeadline = block.timestamp + reviewPeriod`.
+   `fundWithPermit()` (ERC-2612 permit, see [Permit funding](#permit-funding)). Sets the first milestone's
+   `deliveryDeadline = block.timestamp + deliveryPeriod`.
+2. **Submit** — only the freelancer, for the current milestone, after funding, while
+   `block.timestamp < deliveryDeadline`. Records `submittedAt` and `reviewDeadline = block.timestamp + reviewPeriod`.
 3. **Approve** — for the current submitted milestone, at any time after submission (including after the
    review deadline): directly by the client with `approveMilestone()`, or by anyone relaying the client's
    signature with `approveMilestoneBySignature()` (see [Signed approvals](#signed-approvals)).
 4. **Finalize** — anyone, for the current submitted milestone, once `block.timestamp >= reviewDeadline`.
-5. Settlement marks the milestone `Settled`, increments `approvalNonce`, advances `currentMilestone`, and pays
-   out. Settling the last
-   milestone sets the order to `Completed`.
+5. Settlement marks the milestone `Settled`, increments `approvalNonce`, adds the milestone amount to `directPaid`,
+   advances `currentMilestone`, sets the next milestone's `deliveryDeadline = block.timestamp + deliveryPeriod`,
+   and pays out. Settling the last milestone sets the order to `Completed` instead.
+6. **Reclaim** — only the client, when the current milestone is still `Pending` and
+   `block.timestamp >= deliveryDeadline` (see [Delivery expiry](#delivery-expiry-and-claims)).
 
 Every function that targets a milestone takes its index and requires it to equal `currentMilestone`. Milestones are
 strictly sequential, and a stale or duplicated transaction cannot act on a different milestone than intended.
@@ -69,6 +80,30 @@ eligible  <=>  block.timestamp >= reviewDeadline
 ```
 
 At `reviewDeadline - 1` finalization reverts with `ReviewPeriodNotElapsed`; at `reviewDeadline` it succeeds.
+
+## Delivery expiry and claims
+
+Each milestone gets a delivery deadline when it becomes current: at funding for milestone 0, at the settlement of
+the previous milestone for every later one. A failed funding or payout transaction leaves no deadline behind.
+
+| Instant | `submitMilestone` | `reclaimAfterDeliveryExpiry` |
+| --- | --- | --- |
+| `deliveryDeadline - 1` | allowed | reverts `DeliveryPeriodNotElapsed` |
+| `deliveryDeadline` and later | reverts `DeliveryPeriodElapsed` | allowed (client, milestone `Pending`) |
+
+The delivery deadline only limits submission. A milestone submitted in time keeps its review deadline, and direct
+approval, signed approval and timeout finalization work as before, however late they happen. Reclaim is rejected
+for a `Submitted` milestone even long after its delivery deadline.
+
+`reclaimAfterDeliveryExpiry()` moves no tokens. It sets the order to `Terminated`, increments `approvalNonce` once,
+and credits all `outstandingObligations` to `claimable[client]`. The current milestone stays current and `Pending`,
+and later milestones are not touched; the terminal status voids them.
+
+`claimPayout(account)` can be called by anyone and always pays `account`. It clears the credit, reduces
+`outstandingObligations` and increases `claimsPaid` before the transfer. If the transfer fails (for example the token
+blocks the recipient), the whole call reverts and the credit stays for a later retry. Reclaim itself succeeds even
+while the client is blocked, because it transfers nothing. A zero credit reverts with `NothingToClaim`. The order
+stays `Terminated` after all credits are paid.
 
 ## Signed approvals
 
@@ -143,9 +178,16 @@ can be submitted again once the transfer can succeed.
 ### Nonces and replay protection
 
 `approvalNonce` is a single order-wide counter that starts at `0` and increases by exactly one on every successful
-settlement, whether it came from `approveMilestone`, `approveMilestoneBySignature` or `finalizeMilestone`. After
-`k` settlements it equals `k` and equals `currentMilestone`, so the signature for milestone `i` must carry
-nonce `i`.
+settlement, whether it came from `approveMilestone`, `approveMilestoneBySignature` or `finalizeMilestone`, and once
+more when the order is terminated by `reclaimAfterDeliveryExpiry`. Claims do not change it:
+
+```
+currentMilestone == settlementCount
+approvalNonce    == settlementCount + (status == Terminated ? 1 : 0)
+```
+
+While the order is active the signature for milestone `i` must therefore carry nonce `i`. After termination every
+signature fails on the order status, including one that happens to match the incremented nonce.
 
 - **Same milestone twice:** after settlement the milestone is no longer current and the nonce has moved on.
 - **Another milestone:** the index is part of the signed message.
@@ -213,10 +255,22 @@ fee-recipient transfer entirely. The fee is capped at 1,000 bps.
 
 `outstandingObligations` tracks escrow liabilities in storage instead of reading the token balance:
 
-- `0` before funding;
-- `totalAmount` after funding;
-- reduced by each settled milestone's amount;
-- `0` on completion.
+| Status | `outstandingObligations` |
+| --- | --- |
+| `Unfunded` | `0` |
+| `Active` | sum of unsettled milestone amounts |
+| `Completed` | `0` |
+| `Terminated` | sum of unclaimed credits |
+
+Two cumulative counters record what has left the order: `directPaid` (gross settled milestone amounts, protocol fees
+included) and `claimsPaid` (amounts transferred by `claimPayout`). They satisfy
+
+```
+fundedTotal == directPaid + claimsPaid + outstandingObligations
+```
+
+where `fundedTotal` is `0` before funding and `totalAmount` afterwards. All counters are updated before tokens move,
+so a failed transfer rolls them back with the rest of the transaction.
 
 Anyone can transfer tokens directly to an order. Those tokens are not liabilities and do not influence any check:
 funding measures the balance increase of its own transfer, and settlement transfers exactly the milestone amount.
@@ -235,16 +289,18 @@ target).
 - Tokens with transfer hooks are handled defensively: all state-changing functions are `nonReentrant`, and state is
   updated before any external call.
 - Tokens that can block recipients (for example USDC's blacklist) can make a payout revert. The whole settlement
-  then reverts atomically and the milestone stays `Submitted` until the transfer can succeed.
+  then reverts atomically and the milestone stays `Submitted` until the transfer can succeed. A blocked claim
+  reverts the same way and leaves its credit in place.
 
 ## Security notes
 
 - `SafeERC20` for every transfer; `ReentrancyGuard` on `fund`, `fundWithPermit`, `submitMilestone`,
-  `approveMilestone`, `approveMilestoneBySignature` and `finalizeMilestone`.
+  `approveMilestone`, `approveMilestoneBySignature`, `finalizeMilestone`, `reclaimAfterDeliveryExpiry` and
+  `claimPayout`.
 - Checks-effects-interactions: status, obligations and milestone index are updated before tokens move. Funding
   additionally checks the received amount after the transfer.
-- Custom errors for all failures; events `Funded`, `MilestoneSubmitted`, `MilestoneSettled` and `OrderCompleted`
-  for every lifecycle change. A signed approval additionally emits
+- Custom errors for all failures; events `Funded`, `MilestoneSubmitted`, `MilestoneSettled`, `OrderCompleted`,
+  `DeliveryExpired(index, clientCredit)` and `PayoutClaimed(account, amount)` for every lifecycle change. A signed approval additionally emits
   `MilestoneApprovedBySignature(index, client, relayer, nonce)` before `MilestoneSettled`, whose `settledBy` is the
   relayer.
 - Timestamps are stored as `uint64` via `SafeCast`.
@@ -263,21 +319,26 @@ forge coverage
 ```
 
 Tests are split into unit tests (`test/TrustWorkFactory.t.sol`, `test/WorkOrder.t.sol`,
-`test/WorkOrder.signature.t.sol`, `test/WorkOrder.permit.t.sol`), fuzz tests (`test/WorkOrder.fuzz.t.sol`) and a
-stateful invariant suite (`test/invariant/`) that mixes all funding and settlement paths. Mocks under `test/mocks/`
+`test/WorkOrder.signature.t.sol`, `test/WorkOrder.permit.t.sol`, `test/WorkOrder.delivery.t.sol`), fuzz tests (`test/WorkOrder.fuzz.t.sol`) and a
+stateful invariant suite (`test/invariant/`) that mixes all funding, settlement, reclaim and claim paths.
+`test/WorkOrder.delivery.t.sol` also contains a deterministic matrix of every funding path × reclaim at the first,
+middle and last milestone (9 cases); fuzz and invariant runs sample combinations rather than enumerating them. Mocks under `test/mocks/`
 are test-only: `MockUSDC` (6 decimals, open minting), `MockPermitUSDC` (adds ERC-2612), a fee-on-transfer token, a
 blocklist token, a token that re-enters the order during transfers, and an ERC-1271 wallet that can be switched to
 return a wrong magic value or revert.
 
 Run `forge test --match-path 'test/invariant/*' -vv` to print a per-campaign summary of the transitions reached in
-the final run (funding path, settlement paths, rejected stale signatures).
+the final run (funding path, settlement paths, rejected stale signatures and expired submissions, reclaims,
+claims).
 
 ## Current limitations
 
 Not implemented in this stage:
 
-- cancellation, refunds, and any way for the client to recover funds;
-- disputes and arbitration — a submitted milestone is either approved or auto-released after the review period;
+- disputes and arbitration — a submitted milestone is either approved or auto-released after the review period, and
+  the client can only reclaim milestones that were never submitted in time (the design for the remaining slices is
+  in [`docs/stage-3-arbitration-design.md`](docs/stage-3-arbitration-design.md));
+- cancellation by agreement, and any refund other than delivery-expiry reclaim;
 - recovery of unsolicited tokens sent directly to an order;
 - reputation, governance, frontend, deployment scripts, and a relayer service.
 
@@ -287,5 +348,11 @@ Stage 2 caveats:
   way (direct approval, or waiting for the timeout); there is no nonce-cancel function.
 - `fundWithPermit` treats a token whose fallback accepts the `permit` call without reverting the same as a
   successful permit; funding still requires the resulting allowance.
+
+Stage 3B caveats:
+
+- The delivery clock for each milestone starts when it becomes current; a late approval of the previous milestone
+  also delays the next delivery deadline.
+- Orders deployed by the Stage 1/2 factory have no delivery period and cannot be reclaimed.
 
 The milestone count has no explicit cap; creation gas grows linearly with it and is paid by the client.

@@ -22,15 +22,23 @@ Stage 2 (accepted, `5746ac1`): signed approvals and optional permit funding.
   `totalAmount`), then the same deposit logic as `fund()`.
 - Stage 1 behavior, accounting, access control and deadline boundaries are unchanged.
 
-Stage 3A (current): arbitration design only.
+Stage 3A (accepted, `f0a1c1b`): arbitration design in `docs/stage-3-arbitration-design.md` and
+`docs/stage-3-test-plan.md`. Implementation follows its slices S1–S4, each authorized and reviewed separately.
 
-- Deliverables: `docs/stage-3-arbitration-design.md` and `docs/stage-3-test-plan.md`.
-- No changes to contracts, tests, dependencies or compiler settings. Implementation follows the slices
-  in the design document (S1–S4), each authorized and reviewed separately.
+Stage 3B (current): slice S1 — delivery deadlines, delivery-expiry reclaim credits and claims.
 
-Out of scope until a later stage explicitly asks for it: implementing arbitration, disputes, delivery
-deadlines, cancellation or refunds; recovery of unsolicited tokens, reputation, governance, frontend,
-deployment scripts (Base Sepolia comes later), and any relayer service.
+- `deliveryPeriod` (`0 < p <= 180 days`) per order; each milestone's `deliveryDeadline` is set when it becomes
+  current; submission requires `block.timestamp < deliveryDeadline`.
+- `reclaimAfterDeliveryExpiry`: client-only, current milestone `Pending`, `block.timestamp >= deliveryDeadline`;
+  sets `Terminated`, increments `approvalNonce` once, credits all obligations to the client, moves no tokens.
+- `claimPayout(account)`: anyone, pays only `account`, only when `Terminated`.
+- `directPaid` and `claimsPaid` with `fundedTotal == directPaid + claimsPaid + outstandingObligations`.
+- The fee recipient may not be the order itself (`FeeRecipientIsOrder`).
+
+Out of scope until a later stage explicitly asks for it: the arbitration court and registry, disputes,
+voting and their factory or constructor arguments; cancellation by agreement and other refunds; recovery of
+unsolicited tokens, reputation, governance, frontend, deployment scripts (Base Sepolia comes later), and any
+relayer service. Do not add placeholder arbitration functions or hooks.
 
 ## Toolchain
 
@@ -64,6 +72,8 @@ deployment scripts (Base Sepolia comes later), and any relayer service.
 - Escrow obligations are tracked in storage (`outstandingObligations`), never inferred from the raw
   token balance; unsolicited transfers must not block funding or settlement.
 - Each milestone settles at most once; settlement advances the order.
+- Termination pays nothing directly; every post-termination payout is a credit claimed through `claimPayout`,
+  and claim counters update before the transfer.
 - No administrative path may withdraw escrowed funds.
 - Custom errors for failures, events for every lifecycle change.
 - Only exact-transfer ERC-20 tokens are supported; fee-on-transfer and rebasing tokens are not.

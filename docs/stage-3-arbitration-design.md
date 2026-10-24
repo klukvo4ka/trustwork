@@ -1,6 +1,7 @@
 # Stage 3 — Arbitration design
 
-Status: design for review (Stage 3A, revision 2). Nothing in this document is implemented.
+Status: Stage 3A design (revision 2, accepted at `f0a1c1b`) with narrow corrections made during slice S1. Slice S1
+(Stage 3B) is implemented; sections describing the court, registry and disputes are not.
 Baseline: Stage 2, commit `5746ac19e947d4c72b5dbfcf518e4b05ba199165`. Revision 1: `8a3995e`. Section 15 maps the
 review findings R1–R6 to the sections that resolve them.
 
@@ -242,9 +243,16 @@ S4 measures both.
 | Client, freelancer and fee recipient are never candidates in their own dispute | registry `reserveCandidates` (exclusion list) | — |
 | One seat per address per dispute | snapshot entries are distinct listed addresses | — |
 | Client and freelancer differ | order constructor (Stage 1) | `ClientIsFreelancer` |
+| Fee recipient is not the order itself | order constructor (S1) | `FeeRecipientIsOrder` |
 
 **Limitation.** These are address checks. Nothing on-chain can detect that different addresses share a controller:
 a party, an arbitrator and `penaltyRecipient` may be the same person behind different addresses.
+
+The self-fee-recipient check (implemented in S1) exists because an ERC-20 transfer from the order to itself does not
+reduce its balance: a 1,000-unit settlement with a 100-unit fee directed to the order would record 1,000 in
+`directPaid` and zero obligations while 100 stays locked. The fee recipient may still equal the client or the
+freelancer, and may be any other contract. Role addresses are **not** prevented from equaling the court or registry
+address; section 11.4 states why that does not create liabilities.
 
 ### 6.3 Interfaces
 
@@ -357,7 +365,7 @@ interface IArbitrationCourt {
     function getDispute(uint256 disputeId) external view returns (Dispute memory);
     function getSeats(uint256 disputeId) external view returns (Seat[3] memory);
     function rulingOf(uint256 disputeId) external view returns (Ruling ruling, RulingReason reason);
-    function voteCommitment(uint256 disputeId, address arbitrator, Vote vote, bytes32 salt)
+    function voteCommitment(uint256 disputeId, address arbitrator, uint8 vote, bytes32 salt)
         external
         view
         returns (bytes32);
@@ -366,7 +374,7 @@ interface IArbitrationCourt {
     function retrySnapshot(uint256 disputeId) external;
     function drawPanel(uint256 disputeId) external;
     function commitVote(uint256 disputeId, bytes32 commitment) external;
-    function revealVote(uint256 disputeId, Vote vote, bytes32 salt) external;
+    function revealVote(uint256 disputeId, uint8 vote, bytes32 salt) external;
     function resolve(uint256 disputeId) external;
     function claimReward(address account) external returns (uint256 amount);
 }
@@ -475,8 +483,9 @@ Invariants: `locked + reserved <= stake`; `listed` iff `stake + warming >= seatL
   reservations or locks: if `stake + warming < seatLock`, then `locked + reserved <= stake < seatLock`, and both are
   multiples of `seatLock`, so both are 0.
 - **Slot reuse.** Snapshots store addresses, never list positions, so swap-and-pop and later reuse of a slot cannot
-  change any snapshot. An address referenced by an unfinished snapshot has a reservation or lock and is therefore
-  still listed.
+  change any snapshot. An address whose candidate entry is still `Reserved` or `Locked` has a matching reservation
+  or lock and is therefore still listed. Historical `Unselected` and `Released` entries carry no stake and may refer
+  to addresses that have since been delisted or whose slot has been reused.
 
 Cost of occupying all slots: each listed account must keep `stake + warming >= seatLock`, so holding 32 slots needs
 at least `32 * seatLock` of capital for as long as they are held (recoverable on exit).
@@ -636,6 +645,11 @@ commitment = keccak256(abi.encode(VOTE_TAG, block.chainid, address(court), dispu
 ```
 
 `vote` is `1` (Freelancer) or `2` (Client); `salt` is a secret `bytes32`. `voteCommitment(...)` exposes the encoding.
+Both `voteCommitment` and `revealVote` take the vote as a raw `uint8`, not the `Vote` enum: Solidity's ABI decoder
+reverts on an out-of-range enum argument before the function body runs, which would make `InvalidVote` unreachable
+for a value such as `3`. `voteCommitment` hashes any `uint8` without validation, so a client tool can reproduce a
+commitment to an invalid value; `revealVote` rejects values outside `{1, 2}` with `InvalidVote` and stores a valid
+value as the `Vote` enum.
 Chain id, court and dispute bind a commitment to one dispute; the arbitrator field makes a copied commitment
 unrevealable by anyone but its author.
 
@@ -744,9 +758,12 @@ choice removes the incentive when `D` greatly exceeds `seatLock`. **Limitation:*
 - **Lazy voting.** A random reveal still earns a reward; the merits cannot be verified on-chain. A later reputation
   stage is the intended mitigation.
 - **Capacity exhaustion.** Unfinished snapshots and formed panels hold reservations and locks. A participant who
-  opens many disputes (each needing a genuine order with submitted work and costing `F`) can leave too few candidates
-  for a victim's dispute, which then ends `NoPanel`, paying the freelancer. Unfinished spam snapshots can be cleared
-  by anyone calling `drawPanel` after their seed block; formed spam panels keep 3 seats locked each until resolution.
+  opens many disputes (each needing a genuine order with submitted work) can leave too few candidates for a victim's
+  dispute, which then ends `NoPanel`, paying the freelancer. Each spam dispute pays `F` up front; the fee is spent on
+  rewards or penalties only if a panel forms, and is refunded to the spam dispute's client if that dispute itself
+  ends `NoPanel`. Spam disputes that never form a panel therefore cost only capital tied up in escrows and fees for up
+  to `PANEL_PERIOD`, plus gas. Unfinished spam snapshots can be cleared by anyone calling `drawPanel` after their
+  seed block; formed spam panels keep 3 seats locked each until resolution.
 
 ## 11. Outcomes and money flows
 
@@ -832,22 +849,26 @@ Registry:
   balanceOf(registry) = totalStaked + unsolicited transfers to the registry
 ```
 
-Each balance equation is per contract address, so it holds whether `paymentToken == stakeToken` or not. When they are
-the same ERC-20, the contracts still never share custody: tokens move only along these edges.
+Each balance equation is per contract address, so it holds whether `paymentToken == stakeToken` or not. The table
+lists the authorized transitions that move tokens and the liability each one changes.
 
-| From → to | Transition |
-| --- | --- |
-| client → order | O1 |
-| order → freelancer, fee recipient | O3–O5 |
-| order → claimant | O9 |
-| client → court | C1 |
-| arbitrator → registry | R1 |
-| registry → arbitrator | R2 |
-| registry → court | R6 |
-| court → claimant | C7 |
+| From → to | Transition | Liability change |
+| --- | --- | --- |
+| client → order | O1 | order `outstandingObligations` set to `totalAmount` |
+| order → freelancer, fee recipient | O3–O5 | order obligations decrease |
+| order → claimant | O9 | order obligations decrease |
+| client → court | C1 | court `pendingFees` increase |
+| arbitrator → registry | R1 | registry `totalStaked` increase |
+| registry → arbitrator | R2 | registry `totalStaked` decrease |
+| registry → court | R6 | registry `totalStaked` decrease; court `totalClaimable` increase |
+| court → claimant | C7 | court `totalClaimable` decrease |
 
-No edge exists from an order to the court or registry, from the court to an order or the registry, or from the
-registry to an order.
+Only these transitions change liabilities. Role addresses are not restricted from equaling protocol contracts: a fee
+recipient or claimant may be the court, the registry or another order. Such a payout is still the paying contract's
+O3–O5, O9 or C7 transition. The receiving contract records no liability for it, because liabilities are created
+only inside its own deposit or fee routine (O1, C1, R1, R6); for the receiver it is an unsolicited transfer, which
+stays outside every equation and cannot be withdrawn. Slice S4 adds a shared-token regression for this case
+(test plan I-22).
 
 ### 11.5 Trace of the equations
 

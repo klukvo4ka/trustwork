@@ -128,8 +128,8 @@ contract WorkOrderTest is WorkOrderTestBase {
     }
 
     function test_Submit_RecordsReviewDeadline() public {
-        _fund(order);
         vm.warp(1_700_000_000);
+        _fund(order);
 
         vm.expectEmit(address(order));
         emit MilestoneSubmitted(0, 1_700_000_000 + DEFAULT_REVIEW_PERIOD);

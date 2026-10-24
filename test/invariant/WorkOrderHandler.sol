@@ -26,6 +26,13 @@ contract WorkOrderHandler is Test {
     uint256 public settledBySignature;
     uint256 public settledByTimeout;
     uint256 public rejectedStaleSignatures;
+    uint256 public rejectedExpiredSubmissions;
+    uint256 public rejectedEmptyClaims;
+    uint256 public reclaimedAtIndex;
+    uint256 public reclaims;
+    uint256 public creditedTotal;
+    uint256 public claimedTotal;
+    uint256 public claims;
 
     constructor(WorkOrder order_, MockPermitUSDC token_, uint256 clientKey_) {
         order = order_;
@@ -67,9 +74,48 @@ contract WorkOrderHandler is Test {
     function submit() external {
         if (!_currentIs(WorkOrder.MilestoneStatus.Pending)) return;
         uint256 index = order.currentMilestone();
+        uint256 deliveryDeadline = order.getMilestone(index).deliveryDeadline;
         address freelancer = order.freelancer();
+        if (block.timestamp >= deliveryDeadline) {
+            vm.expectRevert(abi.encodeWithSelector(WorkOrder.DeliveryPeriodElapsed.selector, index, deliveryDeadline));
+            ++rejectedExpiredSubmissions;
+        }
         vm.prank(freelancer);
         order.submitMilestone(index);
+    }
+
+    function reclaim() external {
+        if (!_currentIs(WorkOrder.MilestoneStatus.Pending)) return;
+        uint256 index = order.currentMilestone();
+        if (block.timestamp < order.getMilestone(index).deliveryDeadline) return;
+        address client = order.client();
+        uint256 credit = order.outstandingObligations();
+        vm.prank(client);
+        order.reclaimAfterDeliveryExpiry();
+        creditedTotal += credit;
+        reclaimedAtIndex = index;
+        ++reclaims;
+    }
+
+    function claimClientCredit(address caller) external {
+        if (order.status() != WorkOrder.OrderStatus.Terminated) return;
+        address client = order.client();
+        if (order.claimable(client) == 0) return;
+        uint256 balanceBefore = token.balanceOf(client);
+        vm.prank(caller);
+        order.claimPayout(client);
+        claimedTotal += token.balanceOf(client) - balanceBefore;
+        ++claims;
+    }
+
+    function claimWithoutCredit(bool freelancerAccount, address caller) external {
+        if (order.status() != WorkOrder.OrderStatus.Terminated) return;
+        address account = freelancerAccount ? order.freelancer() : order.feeRecipient();
+        if (order.claimable(account) != 0) return;
+        vm.expectRevert(abi.encodeWithSelector(WorkOrder.NothingToClaim.selector, account));
+        vm.prank(caller);
+        order.claimPayout(account);
+        ++rejectedEmptyClaims;
     }
 
     function approve() external {

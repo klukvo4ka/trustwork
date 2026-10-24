@@ -56,7 +56,8 @@ contract WorkOrderFuzzTest is WorkOrderTestBase {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = 100 * USDC;
         vm.prank(client);
-        WorkOrder order = factory.createWorkOrder(freelancer, usdc, feeRecipient, 0, reviewPeriod, amounts);
+        WorkOrder order =
+            factory.createWorkOrder(freelancer, usdc, feeRecipient, 0, reviewPeriod, DEFAULT_DELIVERY_PERIOD, amounts);
         _fund(order);
         _submit(order, 0);
         uint256 deadline = block.timestamp + reviewPeriod;
@@ -167,6 +168,90 @@ contract WorkOrderFuzzTest is WorkOrderTestBase {
 
         assertEq(token.balanceOf(freelancer), total - expectedFees);
         assertEq(uint256(order.status()), uint256(WorkOrder.OrderStatus.Completed));
+    }
+
+    function testFuzz_SubmitAndReclaimAreExclusiveAtEveryInstant(uint256 deliveryPeriod, uint256 elapsed) public {
+        deliveryPeriod = bound(deliveryPeriod, 1, 180 days);
+        elapsed = bound(elapsed, 0, 360 days);
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = 100 * USDC;
+        amounts[1] = 50 * USDC;
+        vm.prank(client);
+        WorkOrder order = factory.createWorkOrder(
+            freelancer, usdc, feeRecipient, DEFAULT_FEE_BPS, DEFAULT_REVIEW_PERIOD, deliveryPeriod, amounts
+        );
+        _fund(order);
+        uint256 deliveryDeadline = block.timestamp + deliveryPeriod;
+        assertEq(order.getMilestone(0).deliveryDeadline, deliveryDeadline);
+
+        vm.warp(block.timestamp + elapsed);
+        if (elapsed < deliveryPeriod) {
+            vm.expectRevert(abi.encodeWithSelector(WorkOrder.DeliveryPeriodNotElapsed.selector, 0, deliveryDeadline));
+            vm.prank(client);
+            order.reclaimAfterDeliveryExpiry();
+            _submit(order, 0);
+            assertEq(uint256(order.getMilestone(0).status), uint256(WorkOrder.MilestoneStatus.Submitted));
+        } else {
+            vm.expectRevert(abi.encodeWithSelector(WorkOrder.DeliveryPeriodElapsed.selector, 0, deliveryDeadline));
+            _submit(order, 0);
+            vm.prank(client);
+            order.reclaimAfterDeliveryExpiry();
+            assertEq(uint256(order.status()), uint256(WorkOrder.OrderStatus.Terminated));
+            assertEq(order.claimable(client), 150 * USDC);
+        }
+    }
+
+    function testFuzz_SettleThenReclaimConservesFunds(
+        uint256[] memory rawAmounts,
+        uint256 feeBps,
+        uint256 settleCount,
+        uint256 settlementPaths,
+        uint256 donation
+    ) public {
+        vm.assume(rawAmounts.length > 0);
+        uint256[] memory amounts = _boundAmounts(rawAmounts);
+        feeBps = bound(feeBps, 0, 1000);
+        settleCount = bound(settleCount, 0, amounts.length - 1);
+        donation = bound(donation, 0, MAX_MILESTONE_AMOUNT);
+        WorkOrder order = _createOrder(usdc, feeBps, amounts);
+        usdc.mint(address(order), donation);
+        _fund(order);
+        uint256 total = order.totalAmount();
+        _assertConserved(order, total);
+
+        uint256 settled;
+        for (uint256 i; i < settleCount; ++i) {
+            _submit(order, i);
+            if ((settlementPaths >> i) & 1 == 1) {
+                vm.warp(order.getMilestone(i).reviewDeadline);
+                order.finalizeMilestone(i);
+            } else {
+                _approve(order, i);
+            }
+            settled += amounts[i];
+            assertEq(order.directPaid(), settled);
+            _assertConserved(order, total);
+        }
+
+        vm.warp(order.getMilestone(settleCount).deliveryDeadline);
+        vm.prank(client);
+        order.reclaimAfterDeliveryExpiry();
+        assertEq(order.claimable(client), total - settled);
+        assertEq(order.approvalNonce(), settleCount + 1);
+        _assertConserved(order, total);
+
+        vm.prank(stranger);
+        order.claimPayout(client);
+        assertEq(usdc.balanceOf(client), total - settled);
+        assertEq(order.claimsPaid(), total - settled);
+        assertEq(order.outstandingObligations(), 0);
+        assertEq(usdc.balanceOf(address(order)), donation);
+        _assertConserved(order, total);
+    }
+
+    function _assertConserved(WorkOrder order, uint256 fundedTotal) private view {
+        assertEq(fundedTotal, order.directPaid() + order.claimsPaid() + order.outstandingObligations());
+        assertGe(usdc.balanceOf(address(order)), order.outstandingObligations());
     }
 
     function _fundThroughPath(WorkOrder order, MockPermitUSDC token, uint256 path) private {

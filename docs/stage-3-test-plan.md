@@ -49,6 +49,8 @@ settlement path per milestone. Matrices M4 and M5 below provide the enumerated c
 | D-15 | Pre-signed approval for the current milestone fails after reclaim (`InvalidOrderStatus`) |
 | D-16 | `directPaid` equals the sum of settlement transfers after each settlement path |
 | D-17 | Regression: every Stage 1/2 unit test passes with the added constructor argument and unchanged assertions |
+| D-18 | Fee recipient equal to the order is rejected with `FeeRecipientIsOrder`, both through the factory (predicted CREATE address) and by direct deployment |
+| D-19 | Fee recipient equal to the client or the freelancer is accepted; settlement, reclaim and claim conserve funds |
 
 ### Fuzz
 
@@ -153,7 +155,7 @@ fairness proof of the seed.
 | C-14 | Commit at `commitDeadline - 1` succeeds; at `commitDeadline` reverts |
 | C-15 | Reveal at `commitDeadline - 1` reverts; at `commitDeadline` succeeds; at `revealDeadline` reverts |
 | C-16 | Reveal with wrong salt, wrong vote, another arbitrator's commitment, or a commitment for another dispute, court or chain: `InvalidReveal`; retry with correct data succeeds |
-| C-17 | Reveal of vote `0` or `3` reverts `InvalidVote`; a seat committed to such a vote ends faulty |
+| C-17 | `revealVote` takes a raw `uint8`: values `0`, `3` and `255` revert `InvalidVote` from the function body (not an ABI decoding failure); `voteCommitment` returns a hash for those values; a seat committed to such a value ends faulty |
 | C-18 | Duplicate reveal reverts `AlreadyRevealed` |
 | C-19 | `voteCommitment` equals an independently computed `keccak256(abi.encode(...))` |
 | C-20 | `resolve` at `revealDeadline - 1` reverts; at `revealDeadline` succeeds; second `resolve` reverts |
@@ -223,6 +225,7 @@ with ≥ 3 candidates and a draw call. Every other case resolves at `panelDeadli
 | I-19 | `forge build --sizes`: runtimes < 24,576 B; factory initcode < 49,152 B |
 | I-20 | **R2 regression:** empty court, `D = 1,000`, `F = 20`: dispute ends `FreelancerWins (NoPanel)`; freelancer `1000 - fee(1000)`, client receives `R` plus the 20 fee refund; client's net equals not disputing |
 | I-21 | Trace §11.5 step by step in `SharedToken` and `SplitToken`, asserting each equation after each step |
+| I-22 | Shared-token recipient aliases: fee recipient set to the court address, and freelancer set to the registry address; payouts arrive as unsolicited balance; `pendingFees`, `totalClaimable` and `totalStaked` are unchanged and the received tokens cannot be withdrawn or claimed |
 
 ### Matrix M3 — ruling × dispute position (guaranteed, 15 cases)
 
@@ -249,8 +252,9 @@ test and must match §4.
 ### Matrix M7 — token configuration (guaranteed, 2 × 7 cases)
 
 `{SharedToken, SplitToken}` × the terminal paths of M4 with `fund`. Asserts the per-contract balance equations of
-§11.4 and the transfer-edge table: handler ghosts record every transfer by (from, to, transition); any transfer not
-listed in §11.4 fails the test.
+§11.4 and the transition table: handler ghosts record every transfer by (from, to, transition); a transfer produced
+by anything other than an authorized transition fails the test, and a transfer into a protocol contract outside its
+deposit or fee routine must leave that contract's liabilities unchanged.
 
 ### Fuzz
 
@@ -269,7 +273,7 @@ listed in §11.4 fails the test.
 | II-04 | Revised nonce invariant (§5.1) |
 | II-05 | Court: CI-01, CI-02, CI-04 |
 | II-06 | Registry: RI-01 … RI-06 |
-| II-07 | Provenance: every token transfer observed by the handler ghosts matches one edge of §11.4; per-contract cumulative inflows minus outflows equal that contract's liabilities |
+| II-07 | Provenance: every token transfer observed by the handler ghosts comes from an authorized transition of §11.4; each contract's liabilities equal its cumulative liability-creating inflows minus its outflows, and transfers into it from other contracts' payouts count only as unsolicited balance |
 | II-08 | An order has at most one dispute; `disputeId != 0` iff status is `Disputed` or terminated by ruling |
 
 Invariant reports list per campaign: terminal states, rulings by reason, funding and settlement paths, rejected stale
@@ -289,7 +293,7 @@ signatures, snapshot retries, re-arms and faults, all as sampled counts.
 | Tie and fallback outcomes | M1, M2, M3, I-20 |
 | Repeated resolution, application, claims | C-12, C-20, C-23, D-09, I-13, I-14 |
 | Failed transfers and callbacks | D-11, D-14, R-26, C-23, C-24, C-27, I-14, I-17 |
-| Conservation of escrow, stake and fee liabilities | DI-01, RI-04, CI-01, CI-04, II-01, II-05…II-07, I-21, M7 |
+| Conservation of escrow, stake and fee liabilities | DI-01, RI-04, CI-01, CI-04, II-01, II-05…II-07, I-21, I-22, M7 |
 | Shared and different token configurations | I-21, M7, II-01…II-08 |
 
 ## 7. Slice acceptance
@@ -315,3 +319,44 @@ A slice is accepted only when all of the following are reported from actual comm
 | II-04 without outstanding obligations | II-01 `fundedTotal == directPaid + claimsPaid + outstanding` | R5 |
 | II-07 by token address | II-07 transfer-edge provenance; M7; both token configurations | R5 |
 | D-08/D-10 pushed refund | D-06, D-08…D-12 credit and claim in S1 | R6 |
+
+## 9. Corrections during slice S1
+
+| Item | Change |
+| --- | --- |
+| Self-fee-recipient | D-18 and D-19 added; design §6.2 |
+| Raw `uint8` vote | C-17 rewritten; design §6.3, §9.1 |
+| Provenance with role aliases | M7 and II-07 reworded; I-22 added; design §11.4 |
+| Listing guarantee | design §7.1 limited to `Reserved` and `Locked` entries |
+| Spam-dispute cost | design §10.5: fees are refunded on `NoPanel` |
+
+## 10. S1 implementation map
+
+| Cases | Test |
+| --- | --- |
+| D-01 | `TrustWorkFactory.t.sol`: `test_RevertWhen_DeliveryPeriodIsZero`, `test_RevertWhen_DeliveryPeriodAboveMaximum`, `test_CreateWorkOrder_AcceptsBoundaryTerms` |
+| D-02 | `WorkOrder.delivery.t.sol`: `test_Fund_SetsFirstDeliveryDeadline`, `test_FundWithPermit_SetsFirstDeliveryDeadlineOnBothPaths`, `test_RevertWhen_FundingFailsLeavesNoDeliveryDeadline` |
+| D-03 | `test_DirectSettlement_…`, `test_SignedSettlement_…`, `test_TimeoutSettlement_SetsNextDeliveryDeadline`, `test_FinalSettlement_CompletesWithoutFurtherDeadline`, `test_RevertWhen_PayoutFailsRollsBackCountersAndNextDeadline` |
+| D-04 | `test_Submit_AllowedOneSecondBeforeDeliveryDeadline`, `test_RevertWhen_SubmitAtDeliveryDeadline`, `test_RevertWhen_SubmitAfterDeliveryDeadline`, `test_DeliveryExpiry_DoesNotAffectSubmittedMilestone` |
+| D-05 | `test_RevertWhen_ReclaimOneSecondBeforeDeliveryDeadline`, `test_Reclaim_AtDeliveryDeadline` |
+| D-06 | `test_Reclaim_AtFirstMilestone`, `…AtMiddleMilestone`, `…AtLastMilestone` |
+| D-07 | `test_RevertWhen_ReclaimCalledByNonClient`, `…BeforeFunding`, `…AfterCompletion`, `…ReclaimTwice`, `test_DeliveryExpiry_DoesNotAffectSubmittedMilestone` |
+| D-08 | `test_Terminated_BlocksEveryLifecycleFunction` |
+| D-09 | `test_ClaimPayout_PaysReclaimCredit`, `test_RevertWhen_ClaimRepeatedOrWithoutCredit` |
+| D-10 | `test_RevertWhen_ClaimBeforeTermination` |
+| D-11 | `test_BlockedClient_ReclaimSucceedsAndClaimRetries` |
+| D-12 | `test_ClaimPayout_ByUnrelatedCallerPaysCreditedAccount` |
+| D-13 | `test_Donations_StayOutsideCreditsAndClaims` |
+| D-14 | `test_Reentrancy_DuringClaimTransferIsBlocked` |
+| D-15 | `test_StaleSignatures_FailAfterTermination` |
+| D-16 | `test_Counters_TrackEverySettlementPath` |
+| D-17 | all Stage 1/2 suites; `test_Submit_RecordsReviewDeadline` sets the clock before funding |
+| D-18 | `TrustWorkFactory.t.sol`: `test_RevertWhen_FeeRecipientIsPredictedOrderAddress`, `test_RevertWhen_DirectlyDeployedOrderIsOwnFeeRecipient` |
+| D-19 | `test_CreateWorkOrder_AllowsFeeRecipientAliases`, `test_FeeRecipientAliases_SettleAndConserve` |
+| Matrix (3 funding paths × reclaim first/middle/last) | `test_Matrix_FundingPathTimesReclaimPosition` (9 cases) |
+| DF-01 | `WorkOrder.fuzz.t.sol`: `testFuzz_SubmitAndReclaimAreExclusiveAtEveryInstant` |
+| DF-02 | `testFuzz_SettleThenReclaimConservesFunds` |
+| DI-01 | `invariant_FundedTotalIsConserved` |
+| DI-02 | `invariant_BalanceCoversObligations` |
+| DI-03 | `invariant_ObligationsMatchStatus` |
+| DI-04 | `invariant_ApprovalNonceCountsSettlementsAndTermination` |

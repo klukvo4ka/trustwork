@@ -12,6 +12,7 @@ abstract contract WorkOrderTestBase is Test {
     uint256 internal constant USDC = 1e6;
     uint256 internal constant DEFAULT_FEE_BPS = 250;
     uint256 internal constant DEFAULT_REVIEW_PERIOD = 7 days;
+    uint256 internal constant DEFAULT_DELIVERY_PERIOD = 14 days;
 
     bytes32 internal constant EIP712_DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
@@ -44,7 +45,9 @@ abstract contract WorkOrderTestBase is Test {
 
     function _createOrder(IERC20 token, uint256 feeBps, uint256[] memory amounts) internal returns (WorkOrder order) {
         vm.prank(client);
-        order = factory.createWorkOrder(freelancer, token, feeRecipient, feeBps, DEFAULT_REVIEW_PERIOD, amounts);
+        order = factory.createWorkOrder(
+            freelancer, token, feeRecipient, feeBps, DEFAULT_REVIEW_PERIOD, DEFAULT_DELIVERY_PERIOD, amounts
+        );
     }
 
     function _createDefaultOrder() internal returns (WorkOrder) {

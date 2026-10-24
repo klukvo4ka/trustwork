@@ -397,7 +397,13 @@ contract WorkOrderSignatureTest is WorkOrderTestBase {
     function _createWalletOrder(MockERC1271Wallet wallet) private returns (WorkOrder walletOrder) {
         vm.prank(address(wallet));
         walletOrder = factory.createWorkOrder(
-            freelancer, usdc, feeRecipient, DEFAULT_FEE_BPS, DEFAULT_REVIEW_PERIOD, _defaultAmounts()
+            freelancer,
+            usdc,
+            feeRecipient,
+            DEFAULT_FEE_BPS,
+            DEFAULT_REVIEW_PERIOD,
+            DEFAULT_DELIVERY_PERIOD,
+            _defaultAmounts()
         );
         usdc.mint(address(wallet), walletOrder.totalAmount());
         vm.startPrank(address(wallet));

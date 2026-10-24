@@ -20,7 +20,8 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     enum OrderStatus {
         Unfunded,
         Active,
-        Completed
+        Completed,
+        Terminated
     }
 
     enum MilestoneStatus {
@@ -34,11 +35,13 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         MilestoneStatus status;
         uint64 submittedAt;
         uint64 reviewDeadline;
+        uint64 deliveryDeadline;
     }
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant MAX_FEE_BPS = 1000;
     uint256 public constant MAX_REVIEW_PERIOD = 30 days;
+    uint256 public constant MAX_DELIVERY_PERIOD = 180 days;
     bytes32 public constant APPROVE_MILESTONE_TYPEHASH =
         keccak256("ApproveMilestone(uint256 milestoneIndex,uint256 nonce,uint256 deadline)");
 
@@ -48,14 +51,21 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     address public immutable feeRecipient;
     uint256 public immutable feeBps;
     uint256 public immutable reviewPeriod;
+    uint256 public immutable deliveryPeriod;
     uint256 public immutable totalAmount;
 
     OrderStatus public status;
     uint256 public currentMilestone;
-    /// @notice Funded milestone amounts not yet settled. Independent of the raw token balance.
+    /// @notice Funded amounts not yet paid out: unsettled milestones while active, unclaimed credits once
+    /// terminated. Independent of the raw token balance.
     uint256 public outstandingObligations;
-    /// @notice Nonce a client approval signature must carry. Incremented by every settlement, however it happens.
+    /// @notice Nonce a client approval signature must carry. Incremented by every settlement and by termination.
     uint256 public approvalNonce;
+    /// @notice Gross milestone amounts paid through settlement, protocol fees included.
+    uint256 public directPaid;
+    /// @notice Amounts transferred through `claimPayout`.
+    uint256 public claimsPaid;
+    mapping(address account => uint256) public claimable;
 
     Milestone[] private _milestones;
 
@@ -68,6 +78,8 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         uint256 indexed index, address indexed client, address indexed relayer, uint256 nonce
     );
     event OrderCompleted();
+    event DeliveryExpired(uint256 indexed index, uint256 clientCredit);
+    event PayoutClaimed(address indexed account, uint256 amount);
 
     error ZeroAddress();
     error ClientIsFreelancer();
@@ -86,6 +98,11 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     error ApprovalSignatureExpired(uint256 deadline);
     error InvalidApprovalNonce(uint256 nonce, uint256 approvalNonce);
     error InvalidApprovalSignature();
+    error FeeRecipientIsOrder();
+    error InvalidDeliveryPeriod(uint256 deliveryPeriod);
+    error DeliveryPeriodElapsed(uint256 index, uint256 deliveryDeadline);
+    error DeliveryPeriodNotElapsed(uint256 index, uint256 deliveryDeadline);
+    error NothingToClaim(address account);
 
     constructor(
         address client_,
@@ -94,6 +111,7 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         address feeRecipient_,
         uint256 feeBps_,
         uint256 reviewPeriod_,
+        uint256 deliveryPeriod_,
         uint256[] memory milestoneAmounts
     ) EIP712("TrustWork", "1") {
         if (
@@ -101,10 +119,14 @@ contract WorkOrder is EIP712, ReentrancyGuard {
                 || address(token_) == address(0)
         ) revert ZeroAddress();
         if (client_ == freelancer_) revert ClientIsFreelancer();
+        if (feeRecipient_ == address(this)) revert FeeRecipientIsOrder();
         if (address(token_).code.length == 0) revert TokenHasNoCode(address(token_));
         if (milestoneAmounts.length == 0) revert NoMilestones();
         if (feeBps_ > MAX_FEE_BPS) revert FeeTooHigh(feeBps_);
         if (reviewPeriod_ == 0 || reviewPeriod_ > MAX_REVIEW_PERIOD) revert InvalidReviewPeriod(reviewPeriod_);
+        if (deliveryPeriod_ == 0 || deliveryPeriod_ > MAX_DELIVERY_PERIOD) {
+            revert InvalidDeliveryPeriod(deliveryPeriod_);
+        }
 
         uint256 total;
         for (uint256 i; i < milestoneAmounts.length; ++i) {
@@ -112,7 +134,11 @@ contract WorkOrder is EIP712, ReentrancyGuard {
             total += milestoneAmounts[i];
             _milestones.push(
                 Milestone({
-                    amount: milestoneAmounts[i], status: MilestoneStatus.Pending, submittedAt: 0, reviewDeadline: 0
+                    amount: milestoneAmounts[i],
+                    status: MilestoneStatus.Pending,
+                    submittedAt: 0,
+                    reviewDeadline: 0,
+                    deliveryDeadline: 0
                 })
             );
         }
@@ -123,6 +149,7 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         feeRecipient = feeRecipient_;
         feeBps = feeBps_;
         reviewPeriod = reviewPeriod_;
+        deliveryPeriod = deliveryPeriod_;
         totalAmount = total;
     }
 
@@ -144,10 +171,14 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         _deposit();
     }
 
-    /// @notice Marks the current milestone as delivered and starts its review period.
+    /// @notice Marks the current milestone as delivered and starts its review period. Allowed only while
+    /// `block.timestamp < deliveryDeadline`.
     function submitMilestone(uint256 index) external nonReentrant {
         if (msg.sender != freelancer) revert NotFreelancer(msg.sender);
         Milestone storage milestone = _currentMilestone(index, MilestoneStatus.Pending);
+        if (block.timestamp >= milestone.deliveryDeadline) {
+            revert DeliveryPeriodElapsed(index, milestone.deliveryDeadline);
+        }
 
         uint64 deadline = SafeCast.toUint64(block.timestamp + reviewPeriod);
         milestone.status = MilestoneStatus.Submitted;
@@ -193,6 +224,39 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         _settle(index, milestone, false);
     }
 
+    /// @notice Terminates the order when the current milestone was not submitted by its delivery deadline, crediting
+    /// every unsettled amount to the client. Allowed from `block.timestamp >= deliveryDeadline`.
+    /// @dev Moves no tokens; the client, or anyone on its behalf, collects the credit with `claimPayout`.
+    function reclaimAfterDeliveryExpiry() external nonReentrant {
+        if (msg.sender != client) revert NotClient(msg.sender);
+        uint256 index = currentMilestone;
+        Milestone storage milestone = _currentMilestone(index, MilestoneStatus.Pending);
+        if (block.timestamp < milestone.deliveryDeadline) {
+            revert DeliveryPeriodNotElapsed(index, milestone.deliveryDeadline);
+        }
+
+        status = OrderStatus.Terminated;
+        ++approvalNonce;
+        uint256 credit = outstandingObligations;
+        claimable[client] += credit;
+
+        emit DeliveryExpired(index, credit);
+    }
+
+    /// @notice Transfers the credit of `account` to `account`. Callable by anyone once the order is terminated.
+    function claimPayout(address account) external nonReentrant returns (uint256 amount) {
+        if (status != OrderStatus.Terminated) revert InvalidOrderStatus(status);
+        amount = claimable[account];
+        if (amount == 0) revert NothingToClaim(account);
+
+        claimable[account] = 0;
+        outstandingObligations -= amount;
+        claimsPaid += amount;
+
+        emit PayoutClaimed(account, amount);
+        token.safeTransfer(account, amount);
+    }
+
     /// @notice EIP-712 digest the client signs to approve `index` with `nonce` until `deadline`.
     function approvalDigest(uint256 index, uint256 nonce, uint256 deadline) public view returns (bytes32) {
         return _hashTypedDataV4(keccak256(abi.encode(APPROVE_MILESTONE_TYPEHASH, index, nonce, deadline)));
@@ -219,6 +283,7 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     function _deposit() private {
         status = OrderStatus.Active;
         outstandingObligations = totalAmount;
+        _milestones[0].deliveryDeadline = _deliveryDeadlineFromNow();
 
         uint256 balanceBefore = token.balanceOf(address(this));
         token.safeTransferFrom(client, address(this), totalAmount);
@@ -243,15 +308,24 @@ contract WorkOrder is EIP712, ReentrancyGuard {
 
         milestone.status = MilestoneStatus.Settled;
         outstandingObligations -= amount;
+        directPaid += amount;
         ++approvalNonce;
         currentMilestone = index + 1;
         bool completed = index + 1 == _milestones.length;
-        if (completed) status = OrderStatus.Completed;
+        if (completed) {
+            status = OrderStatus.Completed;
+        } else {
+            _milestones[index + 1].deliveryDeadline = _deliveryDeadlineFromNow();
+        }
 
         emit MilestoneSettled(index, msg.sender, byTimeout, freelancerPayout, fee);
         if (completed) emit OrderCompleted();
 
         if (fee != 0) token.safeTransfer(feeRecipient, fee);
         token.safeTransfer(freelancer, freelancerPayout);
+    }
+
+    function _deliveryDeadlineFromNow() private view returns (uint64) {
+        return SafeCast.toUint64(block.timestamp + deliveryPeriod);
     }
 }

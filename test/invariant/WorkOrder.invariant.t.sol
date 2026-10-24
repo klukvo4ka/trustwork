@@ -27,17 +27,31 @@ contract WorkOrderInvariantTest is StdInvariant, WorkOrderTestBase {
         targetContract(address(handler));
     }
 
-    function invariant_ObligationsEqualUnsettledFundedAmounts() public view {
-        uint256 unsettled;
-        if (order.status() != WorkOrder.OrderStatus.Unfunded) {
+    function invariant_FundedTotalIsConserved() public view {
+        assertEq(_fundedAmount(), order.directPaid() + order.claimsPaid() + order.outstandingObligations());
+        assertEq(order.directPaid(), handler.settledTotal());
+        assertEq(order.claimsPaid(), handler.claimedTotal());
+    }
+
+    function invariant_ObligationsMatchStatus() public view {
+        WorkOrder.OrderStatus status = order.status();
+        uint256 outstanding = order.outstandingObligations();
+        if (status == WorkOrder.OrderStatus.Unfunded || status == WorkOrder.OrderStatus.Completed) {
+            assertEq(outstanding, 0);
+        } else if (status == WorkOrder.OrderStatus.Active) {
+            uint256 unsettled;
             for (uint256 i; i < order.milestoneCount(); ++i) {
                 if (order.getMilestone(i).status != WorkOrder.MilestoneStatus.Settled) {
                     unsettled += order.getMilestone(i).amount;
                 }
             }
+            assertEq(outstanding, unsettled);
+        } else {
+            assertEq(outstanding, order.claimable(client) + order.claimable(freelancer) + order.claimable(feeRecipient));
+            assertEq(outstanding, handler.creditedTotal() - handler.claimedTotal());
+            assertEq(order.claimable(freelancer), 0);
+            assertEq(order.claimable(feeRecipient), 0);
         }
-        assertEq(order.outstandingObligations(), unsettled);
-        assertEq(order.outstandingObligations(), _fundedAmount() - handler.settledTotal());
     }
 
     function invariant_BalanceCoversObligations() public view {
@@ -47,6 +61,7 @@ contract WorkOrderInvariantTest is StdInvariant, WorkOrderTestBase {
 
     function invariant_PayoutsEqualSettledAmounts() public view {
         assertEq(token.balanceOf(freelancer) + token.balanceOf(feeRecipient), handler.settledTotal());
+        assertEq(token.balanceOf(client), handler.claimedTotal());
         assertLe(token.balanceOf(feeRecipient) * 10, handler.settledTotal());
     }
 
@@ -59,12 +74,34 @@ contract WorkOrderInvariantTest is StdInvariant, WorkOrderTestBase {
         }
         bool completed = order.status() == WorkOrder.OrderStatus.Completed;
         assertEq(completed, current == order.milestoneCount());
-        if (completed) assertEq(order.outstandingObligations(), 0);
+        if (order.status() == WorkOrder.OrderStatus.Terminated) {
+            assertEq(current, handler.reclaimedAtIndex());
+            assertEq(uint256(order.getMilestone(current).status), uint256(WorkOrder.MilestoneStatus.Pending));
+        }
     }
 
-    function invariant_ApprovalNonceCountsSettlements() public view {
-        assertEq(order.approvalNonce(), handler.settlementCount());
-        assertEq(order.approvalNonce(), order.currentMilestone());
+    function invariant_ApprovalNonceCountsSettlementsAndTermination() public view {
+        uint256 terminated = order.status() == WorkOrder.OrderStatus.Terminated ? 1 : 0;
+        assertEq(order.approvalNonce(), handler.settlementCount() + terminated);
+        assertEq(order.currentMilestone(), handler.settlementCount());
+        assertLe(handler.reclaims(), 1);
+        assertEq(handler.reclaims(), terminated);
+    }
+
+    function invariant_DeliveryDeadlinesFollowSchedule() public view {
+        if (order.status() == WorkOrder.OrderStatus.Unfunded) {
+            assertEq(order.getMilestone(0).deliveryDeadline, 0);
+            return;
+        }
+        uint256 current = order.currentMilestone();
+        for (uint256 i; i < order.milestoneCount(); ++i) {
+            uint256 deliveryDeadline = order.getMilestone(i).deliveryDeadline;
+            if (i <= current) assertGt(deliveryDeadline, 0);
+            else assertEq(deliveryDeadline, 0);
+            if (order.getMilestone(i).status != WorkOrder.MilestoneStatus.Pending) {
+                assertLt(order.getMilestone(i).submittedAt, deliveryDeadline);
+            }
+        }
     }
 
     function invariant_FundedAtMostOnce() public view {
@@ -96,7 +133,19 @@ contract WorkOrderInvariantTest is StdInvariant, WorkOrderTestBase {
                     " staleRejected=",
                     vm.toString(handler.rejectedStaleSignatures()),
                     " donatedBeforeFunding=",
-                    vm.toString(handler.donatedBeforeFunding() > 0 ? 1 : 0)
+                    vm.toString(handler.donatedBeforeFunding() > 0 ? 1 : 0),
+                    " expiredSubmitRejected=",
+                    vm.toString(handler.rejectedExpiredSubmissions()),
+                    string.concat(
+                        " reclaims=",
+                        vm.toString(handler.reclaims()),
+                        " reclaimIndex=",
+                        vm.toString(handler.reclaimedAtIndex()),
+                        " claims=",
+                        vm.toString(handler.claims()),
+                        " emptyClaimRejected=",
+                        vm.toString(handler.rejectedEmptyClaims())
+                    )
                 )
             )
         );
