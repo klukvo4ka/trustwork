@@ -1,31 +1,32 @@
 # Stage 3 — Test plan
 
-Companion to [stage-3-arbitration-design.md](stage-3-arbitration-design.md). Section references (§) point to that
-document. Case IDs are stable so implementation slices can report them.
+Companion to [stage-3-arbitration-design.md](stage-3-arbitration-design.md) (revision 2). Section references (§)
+point to that document. Case IDs are stable so implementation slices can report them; IDs changed or added in
+revision 2 are listed in section 8.
 
 ## 1. Conventions
 
 - **Unit** tests are deterministic and assert exact state, balances, events and revert data.
-- **Matrix** tests are deterministic loops over an explicit, fully enumerated input table. They are the only tests
-  that may claim guaranteed coverage of a combination space.
-- **Fuzz** tests sample bounded inputs. Each run executes one sampled combination; a campaign of N runs does not
-  enumerate the combination space, and reports must say "sampled", never "covered every combination".
-- **Invariant** tests drive a handler through random action sequences and check properties after every call. Their
-  reports state per-campaign transition counters from the final run and, where useful, aggregated samples across
-  seeds; they are evidence of reachability, not exhaustive coverage.
-- Boundary tests always check three instants: `deadline - 1`, `deadline`, `deadline + 1`.
-- Every revert test also asserts that the relevant state is unchanged: order status, milestone status,
-  `approvalNonce`, `outstandingObligations`, balances, registry account, court dispute.
+- **Matrix** tests are deterministic loops over a fully enumerated input table. Only matrices may claim guaranteed
+  coverage of a combination space, and they are reported as counts (for example "M1: 125/125").
+- **Fuzz** tests sample bounded inputs. Each run executes one sampled combination; a campaign does not enumerate the
+  combination space and is reported as "sampled".
+- **Invariant** tests drive handlers through random action sequences. Reports give per-campaign transition counters
+  from the final run and, where useful, aggregated samples across seeds. They show reachability, not exhaustiveness.
+- Boundary tests check `deadline - 1`, `deadline` and `deadline + 1` (or the block-number equivalent).
+- Every revert test asserts unchanged state: order and milestone status, `approvalNonce`, `outstandingObligations`,
+  counters, balances, registry account and candidate states, court dispute.
+- **Token configurations.** Every slice that moves both escrow and stake runs its integration cases in
+  `SharedToken` (`paymentToken == stakeToken`, one `MockUSDC`) and `SplitToken` (distinct `MockUSDC` instances).
 - Mocks stay under `test/`. Reused: `MockUSDC`, `MockPermitUSDC`, `BlocklistToken`, `FeeOnTransferToken`,
-  `ReentrantToken`, `MockERC1271Wallet`. New: `MockArbitrationFactory` and `MockDisputableOrder` (S3 only),
-  `RegistryCourtHarness` (S2 only).
+  `ReentrantToken`, `MockERC1271Wallet`. New: `RegistryCourtHarness` (S2), `MockArbitrationFactory` and
+  `MockDisputableOrder` (S3), `PausableMockToken` (S3, to make registry → court transfers fail).
 
 **Correction to the Stage 2 report.** The Stage 2 handoff said the lifecycle fuzz test "covers every combination of
-funding path and settlement path in each run". That is inaccurate: each run picks one funding path and one
-settlement path per milestone from fuzzed bits, so combinations are sampled across runs. The Stage 3 matrices below
-(M1–M6) provide the guaranteed coverage.
+funding path and settlement path in each run". That is inaccurate: each run samples one funding path and one
+settlement path per milestone. Matrices M4 and M5 below provide the enumerated coverage.
 
-## 2. Slice S1 — delivery deadline and reclaim
+## 2. Slice S1 — delivery deadline, reclaim credits and claims
 
 ### Unit
 
@@ -36,75 +37,101 @@ settlement path per milestone from fuzzed bits, so combinations are sampled acro
 | D-03 | Settlement of `k` sets `m[k+1].deliveryDeadline = settledAt + deliveryPeriod` for direct, signed and timeout settlement |
 | D-04 | `submitMilestone` at `deliveryDeadline - 1` succeeds; at `deliveryDeadline` and `+ 1` reverts `DeliveryPeriodElapsed` |
 | D-05 | `reclaimAfterDeliveryExpiry` at `deliveryDeadline - 1` reverts `DeliveryPeriodNotElapsed`; at the deadline succeeds |
-| D-06 | Reclaim at milestone 0, a middle milestone and the last milestone: refund equals unsettled sum; `outstanding == 0`; `Terminated`; `approvalNonce` incremented once; `DeliveryExpired` emitted |
-| D-07 | Reclaim reverts for non-client callers (`NotClient`), when `Unfunded`, `Completed`, `Terminated`, and when the current milestone is `Submitted` (even far past the delivery deadline) |
-| D-08 | After reclaim every mutating function reverts with `InvalidOrderStatus(Terminated)`, except `claimPayout`, which reverts `NothingToClaim` because reclaim pays directly |
-| D-09 | Donation before and after funding: reclaim refunds only obligations; donation remains in the order |
-| D-10 | Reclaim with a blocklisted client reverts and leaves state unchanged; succeeds after unblocking |
-| D-11 | `ReentrantToken` callback during the reclaim transfer re-entering reclaim, approve, finalize: blocked with `ReentrancyGuardReentrantCall` |
-| D-12 | Pre-signed approval for the current milestone fails after reclaim (`InvalidOrderStatus`) |
-| D-13 | Regression: every Stage 1/2 unit test passes with the added constructor arguments and unchanged assertions |
+| D-06 | Reclaim at the first, a middle and the last milestone: `claimable[client]` equals the unsettled sum; `outstanding` unchanged; no token moves; `Terminated`; nonce +1; `DeliveryExpired` |
+| D-07 | Reclaim reverts for non-client callers (`NotClient`); when `Unfunded`, `Completed`, `Terminated`; when the current milestone is `Submitted`, even far past the delivery deadline |
+| D-08 | After reclaim every mutating function except `claimPayout` reverts `InvalidOrderStatus(Terminated)` |
+| D-09 | `claimPayout(client)` after reclaim: pays exactly the credit; `outstanding == 0`; `claimsPaid` updated; second claim reverts `NothingToClaim`; claims for freelancer and fee recipient revert `NothingToClaim` |
+| D-10 | `claimPayout` while `Unfunded`, `Active` or `Completed` reverts `InvalidOrderStatus` |
+| D-11 | Blocklisted client: reclaim **succeeds** (no transfer); `claimPayout(client)` reverts and the credit remains; succeeds after unblocking |
+| D-12 | `claimPayout(client)` called by a third party pays the client, not the caller |
+| D-13 | Donation before and after funding: credit equals obligations only; donation stays in the order |
+| D-14 | `ReentrantToken` callback during the claim transfer re-entering `claimPayout`, reclaim, approve: blocked with `ReentrancyGuardReentrantCall` |
+| D-15 | Pre-signed approval for the current milestone fails after reclaim (`InvalidOrderStatus`) |
+| D-16 | `directPaid` equals the sum of settlement transfers after each settlement path |
+| D-17 | Regression: every Stage 1/2 unit test passes with the added constructor argument and unchanged assertions |
 
 ### Fuzz
 
 | ID | Case |
 | --- | --- |
-| DF-01 | `deliveryPeriod ∈ [1, MAX]`, elapsed `∈ [0, 2·MAX]`: exactly one of submit / reclaim succeeds at each sampled instant |
-| DF-02 | Sampled lifecycle with a sampled stopping point: settle a sampled number of milestones, then reclaim; refund + paid out == total |
+| DF-01 | `deliveryPeriod ∈ [1, MAX]`, elapsed `∈ [0, 2·MAX]`: exactly one of submit and reclaim succeeds at the sampled instant |
+| DF-02 | Sampled settlements followed by reclaim and claim: `fundedTotal == directPaid + claimsPaid + outstanding` after every step |
+
+### Invariants (handler: fund, submit, approve, signed approve, finalize, warp, reclaim, claim, donate)
+
+| ID | Property |
+| --- | --- |
+| DI-01 | `fundedTotal == directPaid + claimsPaid + outstandingObligations` |
+| DI-02 | `balanceOf(order) == outstandingObligations + donations` |
+| DI-03 | `outstandingObligations` matches the per-status definition (§3.1) |
+| DI-04 | Revised nonce invariant (§5.1) |
 
 ## 3. Slice S2 — arbitrator registry
 
-Tests use `RegistryCourtHarness`, which deploys the registry (becoming its court) and exposes `drawAndLock` and
-`release`.
+`RegistryCourtHarness` deploys the registry (becoming its court) and exposes the four court-only functions.
 
 ### Unit
 
 | ID | Case |
 | --- | --- |
-| R-01 | Deposit: exact transfer, `warming`, `warmingUntil`, `totalStaked`, event; zero amount reverts; fee-on-transfer token reverts |
-| R-02 | Maturity boundary: stake ineligible at `warmingUntil - 1` reference time, eligible at `warmingUntil` |
-| R-03 | Top-up while warming resets `warmingUntil` for the whole warming bucket; matured stake is unaffected |
-| R-04 | Registration up to 64 accounts; the 65th distinct depositor reverts `RegistryFull`; an existing account can top up when full |
-| R-05 | Empty account removed by swap-and-pop on withdraw; list indices remain consistent; slot is reusable |
-| R-06 | `requestWithdrawal` above `stake` reverts; a new request replaces the old one and resets the timer; `0` cancels |
-| R-07 | Withdraw at `withdrawableAt - 1` reverts; at `withdrawableAt` transfers `min(pending, stake - locked)` |
-| R-08 | Partial withdrawal while locked: remainder stays pending; completes after `release` |
-| R-09 | Pending stake is lockable before `withdrawableAt` and excluded for reference times `>= withdrawableAt` |
-| R-10 | `drawAndLock` / `release` revert for any caller other than the court |
-| R-11 | `release` with penalty: `stake` and `locked` reduced, penalty transferred to the court, `totalStaked` reduced |
-| R-12 | `eligibleSeats` integer division: `stake = 350`, `seatLock = 100` → 3; fourth concurrent draw sees 0 |
-| R-13 | Excluded addresses (client, freelancer, fee recipient) are never selected, even with the largest stake |
-| R-14 | Fewer than 3 eligible accounts → `drawn == false`, no state written |
-| R-15 | Exactly 3 eligible → all three selected, each locked once |
-| R-16 | No address appears twice in one panel for seeds that would hit it repeatedly (constructed seeds) |
-| R-17 | Weighted walk boundaries: constructed seeds that land on the first unit, the last unit, and the boundary between two accounts select the expected accounts |
-| R-18 | Gas: `drawAndLock` with 64 accounts stays below 1,500,000 gas (`vm.lastCallGas` / gas snapshot) |
-| R-19 | Donations to the registry do not change `totalStaked` or any account and cannot be withdrawn |
-| R-20 | `ReentrantToken` callbacks during deposit, withdraw and penalty transfer: re-entry blocked |
+| R-01 | Deposit: exact transfer, `warming`, `warmingUntil`, `totalStaked`, `depositsReceived`, events; zero amount reverts; fee-on-transfer token reverts |
+| R-02 | Admission: unlisted deposit of `seatLock - 1` reverts `BelowListingMinimum`; `seatLock` lists the account; a delisted account holding 50 may re-list by depositing 50 |
+| R-03 | Registry full: 32 listed; the 33rd distinct depositor reverts `RegistryFull`; listed accounts may still top up |
+| R-04 | `penaltyRecipient` deposit reverts `PenaltyRecipientCannotStake` |
+| R-05 | Maturity: warming stake is not a candidate at `warmingUntil - 1`; is a candidate in a snapshot taken at `warmingUntil` |
+| R-06 | Top-up while warming resets `warmingUntil` for the whole warming bucket; matured stake is unaffected |
+| R-07 | Withdraw: `0` reverts; above `stake - locked - reserved` reverts; warming is not withdrawable; exact amount transferred |
+| R-08 | Automatic delisting on withdraw below `seatLock`; swap-and-pop keeps positions consistent; the freed slot is reusable |
+| R-09 | **R3 regression:** `stake = locked = 100`; `releaseSeat` with penalty 100 → `stake == 0`, `locked == 0`, candidate `Released`, account delisted, 100 sent to the court, `penaltiesSent == 100` |
+| R-10 | Partial penalty: `stake 250, locked 100, reserved 100`; penalty 100 → `stake 150`, still listed, reservation intact |
+| R-11 | Penalty leaving `0 < stake < seatLock` delists; the remainder is withdrawable; no reservation or lock remains |
+| R-12 | Court-only functions revert for any other caller |
+| R-13 | Snapshot: candidates are listed, non-excluded accounts with `free >= seatLock`, in listing order; each reserved exactly `seatLock`; `CandidatesReserved` lists them |
+| R-14 | Fewer than 3 candidates: returns the count; no reservation, no snapshot state written |
+| R-15 | Second `reserveCandidates` for the same dispute reverts |
+| R-16 | Deposit, maturation, withdrawal, penalty in another dispute and delisting attempts after a snapshot do not change `candidatesOf(id)` or its reservations (one case each) |
+| R-17 | Reserved stake cannot be withdrawn; the attempt reverts and leaves the account unchanged |
+| R-18 | Concurrency: account with free `3 · seatLock` appears in 3 snapshots; a 4th snapshot excludes it; locks + reservations never exceed stake |
+| R-19 | `selectPanel` with constructed seeds: first, last and middle candidates selectable; 3 distinct indices; selected → `Locked`, others → `Unselected`; reservations returned |
+| R-20 | `selectPanel` twice, `releaseReservations` after selection, `selectPanel` after release: all revert |
+| R-21 | `releaseSeat` on `Unselected`, `Reserved`, `Released`, out-of-range index, unknown dispute: revert `UnknownSeat`; a second release of the same seat reverts |
+| R-22 | `releaseReservations` returns every reservation and marks candidates `Released` |
+| R-23 | Slot reuse: a delisted address's slot reused by a new account; existing snapshots still reference the original addresses |
+| R-24 | Gas: snapshot with 32 candidates ≤ 2,000,000; `selectPanel` ≤ 800,000; `releaseReservations` with 32 ≤ 800,000 (gas snapshots) |
+| R-25 | Donations to the registry change no account, counter or `totalStaked` and cannot be withdrawn |
+| R-26 | `ReentrantToken` callbacks during deposit, withdraw and penalty transfer: re-entry blocked |
+
+### Matrix M0 — Sybil example (guaranteed)
+
+Deterministic enumeration over all `C(5,3) = 10` index triples for five 100-stake candidates where one owner holds
+three: owner seat counts `{1: 3 triples, 2: 6 triples, 3: 1 triple}`, expected value 1.8, `P(>= 2) = 7/10`. The
+unsplit configuration (300, 100, 100) yields exactly 3 candidates and 1 owner seat. This documents §7.6; it is not a
+fairness proof of the seed.
 
 ### Fuzz
 
 | ID | Case |
 | --- | --- |
-| RF-01 | Sampled deposits, requests and withdrawals with bounded amounts and times: balances match a reference model |
-| RF-02 | Sampled stake distributions (≤ 64 accounts) and seeds: panel has 3 distinct eligible, non-excluded members; locks equal `3 · seatLock` |
-| RF-03 | Selection frequency over many seeds for a fixed distribution is within a stated tolerance of capacity weights (statistical sanity check, not a proof of fairness) |
+| RF-01 | Sampled deposits, withdrawals, warps and penalties against a reference model: accounts, listing and counters match |
+| RF-02 | Sampled listings (≤ 32) and seeds: panel is 3 distinct non-excluded snapshot members; reservations fully returned |
+| RF-03 | Sampled seeds over a fixed snapshot: selection frequencies per candidate within a stated tolerance of uniform (sanity check of the index arithmetic, not of seed quality) |
 
-### Invariants (handler: deposit, request, withdraw, warp, draw, release, donate)
+### Invariants (handler: deposit, withdraw, warp, snapshot, select, releaseReservations, releaseSeat, donate)
 
 | ID | Property |
 | --- | --- |
-| RI-01 | `locked <= stake` for every account |
-| RI-02 | `sum(locked) == seatLock · openSeats` (handler ghost) |
+| RI-01 | `locked + reserved <= stake` for every account |
+| RI-02 | `locked == seatLock · #Locked` and `reserved == seatLock · #Reserved` per account |
 | RI-03 | `totalStaked == sum(stake + warming)` |
-| RI-04 | `balanceOf(registry) == totalStaked + donations` |
-| RI-05 | Total withdrawn + total penalized + `totalStaked` == total deposited |
-| RI-06 | `arbitratorCount <= 64` and the list contains no duplicates or empty accounts |
+| RI-04 | `depositsReceived == withdrawalsPaid + penaltiesSent + totalStaked` |
+| RI-05 | `balanceOf(registry) == totalStaked + donations` |
+| RI-06 | `listed` iff `stake + warming >= seatLock`; `listedCount <= 32`; no duplicates in the list |
+| RI-07 | Candidate states only follow the transitions in §8.1; stored snapshot addresses never change |
 
 ## 4. Slice S3 — arbitration court
 
-Tests use `MockArbitrationFactory` (deploys the court, answers `isWorkOrder`) and `MockDisputableOrder` (exposes
-parties and calls `openDispute`).
+`MockArbitrationFactory` deploys the court and answers `isWorkOrder`; `MockDisputableOrder` exposes parties and calls
+`openDispute`.
 
 ### Unit
 
@@ -112,61 +139,62 @@ parties and calls `openDispute`).
 | --- | --- |
 | C-01 | Constructor validation: zero token, token without code, zero fee, zero `seatLock`, zero `penaltyRecipient` |
 | C-02 | `openDispute` from an address the factory does not recognize reverts `UnknownOrder` |
-| C-03 | `openDispute` pulls exactly `disputeFee` from the client; insufficient allowance or balance reverts; fee-on-transfer token reverts |
-| C-04 | Parties are read from the order; dispute fields and `selectionBlock = block.number + 10` |
-| C-05 | `drawPanel` at `selectionBlock` reverts; at `selectionBlock + 1` draws |
-| C-06 | Blockhash expiry: draw at `selectionBlock + 257` re-arms and emits `SelectionRearmed`; draw after the new seed block succeeds |
-| C-07 | Insufficient eligible arbitrators re-arms; a retry succeeds after another dispute's `resolve` releases enough locks; stake deposited after `openedAt`, or warming stake maturing after `openedAt`, never counts |
-| C-08 | `drawPanel` at `panelDeadline - 1` allowed; at `panelDeadline` reverts; `resolve` at `panelDeadline - 1` reverts, at `panelDeadline` gives `Split (NoPanel)` |
-| C-09 | Repeated `drawPanel` after drawing reverts |
-| C-10 | Commit by a non-panelist reverts; zero commitment reverts; duplicate commit reverts `AlreadyCommitted` |
-| C-11 | Commit at `commitDeadline - 1` succeeds; at `commitDeadline` reverts |
-| C-12 | Reveal at `commitDeadline - 1` reverts; at `commitDeadline` succeeds; at `revealDeadline` reverts |
-| C-13 | Reveal with wrong salt, wrong vote, another arbitrator's commitment, or a commitment built for another dispute, court or chain: `InvalidReveal`, retry with correct data succeeds |
-| C-14 | Reveal of vote `0` or `3` reverts `InvalidVote`; a seat committed to such a vote ends faulty |
-| C-15 | Duplicate reveal reverts `AlreadyRevealed` |
-| C-16 | `voteCommitment` equals an independently computed `keccak256(abi.encode(...))` |
-| C-17 | `resolve` at `revealDeadline - 1` reverts; at `revealDeadline` succeeds; second `resolve` reverts |
-| C-18 | Reward and penalty arithmetic for each row of §11.3 with exact amounts and dust |
-| C-19 | Penalties and unearned fees credited to `penaltyRecipient`, never to parties or panelists |
-| C-20 | `claimReward` pays `account`; zero claim reverts; blocklisted account's claim reverts without affecting others' claims or the recorded ruling |
-| C-21 | Penalty transfer failure during `resolve` (registry token paused in a mock) reverts `resolve` atomically; retry after unpause succeeds |
-| C-22 | Concurrent disputes: one arbitrator on several panels; locks and releases per dispute; a fault in one dispute does not affect locks in another |
-| C-23 | Reentrancy: callbacks during fee pull, penalty transfer and claim attempt `resolve`, `claimReward`, `drawPanel`: blocked |
+| C-03 | Fee pull: exactly `F`; insufficient allowance or balance reverts with no dispute created; fee-on-transfer token reverts |
+| C-04 | With ≥ 3 candidates: `AwaitingSeed`, `selectionBlock = block.number + 10`, snapshot stored; with fewer: `AwaitingCandidates`, nothing reserved |
+| C-05 | `retrySnapshot` succeeds once enough free stake exists; a second call reverts; calling it in `AwaitingSeed` reverts |
+| C-06 | `retrySnapshot` at `panelDeadline - 1` allowed; at `panelDeadline` reverts |
+| C-07 | `drawPanel` at `selectionBlock` reverts; at `selectionBlock + 1` draws |
+| C-08 | Blockhash expiry: at `selectionBlock + 257` `drawPanel` re-arms against the same snapshot (candidate list unchanged); later draw succeeds |
+| C-09 | Registry changes between snapshot and draw (deposits, withdrawals of unreserved stake, penalties elsewhere) leave the drawn panel equal to the panel computed from the stored snapshot and seed |
+| C-10 | `drawPanel` at `panelDeadline - 1` allowed; at `panelDeadline` reverts; `resolve` at `panelDeadline - 1` reverts and at `panelDeadline` records `FreelancerWins (NoPanel)` from both `AwaitingCandidates` and `AwaitingSeed` |
+| C-11 | `NoPanel` from `AwaitingSeed` releases every reservation; client credited `F`; no penalties |
+| C-12 | Repeated `drawPanel` after drawing reverts |
+| C-13 | Commit by non-panelist reverts; zero commitment reverts; duplicate commit reverts `AlreadyCommitted` |
+| C-14 | Commit at `commitDeadline - 1` succeeds; at `commitDeadline` reverts |
+| C-15 | Reveal at `commitDeadline - 1` reverts; at `commitDeadline` succeeds; at `revealDeadline` reverts |
+| C-16 | Reveal with wrong salt, wrong vote, another arbitrator's commitment, or a commitment for another dispute, court or chain: `InvalidReveal`; retry with correct data succeeds |
+| C-17 | Reveal of vote `0` or `3` reverts `InvalidVote`; a seat committed to such a vote ends faulty |
+| C-18 | Duplicate reveal reverts `AlreadyRevealed` |
+| C-19 | `voteCommitment` equals an independently computed `keccak256(abi.encode(...))` |
+| C-20 | `resolve` at `revealDeadline - 1` reverts; at `revealDeadline` succeeds; second `resolve` reverts |
+| C-21 | Each court row of §11.3 with exact amounts, dust and counters |
+| C-22 | Fee share rises from `floor(F/3)` to `floor(F/2)` when one seat is faulty (§10.3) |
+| C-23 | `claimReward` pays `account`; zero claim reverts; a blocklisted account's claim reverts without affecting other claims or the ruling |
+| C-24 | Registry → court penalty transfer failing (`PausableMockToken`) reverts `resolve` atomically; retry after unpause succeeds |
+| C-25 | Concurrent disputes: one arbitrator on several panels and snapshots; a fault in one leaves the others' locks and reservations intact |
+| C-26 | Gas: `openDispute` with 32 candidates, `drawPanel`, `NoPanel` resolve, panel resolve within §7.5 targets |
+| C-27 | Reentrancy: callbacks during fee pull, penalty transfer and claim re-entering `resolve`, `claimReward`, `drawPanel`, `retrySnapshot`: blocked |
 
-### Matrix M1 — reveal patterns (guaranteed)
+### Matrix M1 — reveal patterns (guaranteed, 125 cases)
 
-Each seat takes one of 5 behaviors: `NoCommit`, `CommitNoReveal`, `CommitUnrevealableVote`, `RevealFreelancer`,
-`RevealClient`. The test loops over all `5^3 = 125` assignments, each in a fresh dispute, and asserts:
+Each seat takes one of `NoCommit`, `CommitNoReveal`, `CommitUnrevealableVote`, `RevealFreelancer`, `RevealClient`.
+All `5^3 = 125` assignments, each in a fresh dispute, assert: ruling and reason per §9.3; `r`, `floor(F / r)`, `P·L`,
+`penaltyRecipient` credit; `rewards + recipientCredit == F + P·L`; every lock released; faulty seats lose exactly `L`.
 
-- ruling and `SplitReason` per §9.3;
-- `validReveals`, `rewardPerReveal`, penalties `P · L`, `penaltyRecipient` credit;
-- `rewards + recipientCredit == F + P · L`;
-- every seat's lock released; faulty seats lose exactly `L`.
+### Matrix M2 — panel availability (guaranteed, 10 cases)
 
-### Matrix M2 — panel availability (guaranteed)
-
-Eligible counts `{0, 1, 2, 3, 4}` × draw attempt `{called before panelDeadline, never called}` = 10 cases. A panel
-forms only with at least 3 eligible accounts and a draw call; every other case resolves to `Split (NoPanel)` at
-`panelDeadline`, with the fee flow per §11.3.
+Candidate counts `{0, 1, 2, 3, 4}` × draw attempt `{called before panelDeadline, never called}`. A panel forms only
+with ≥ 3 candidates and a draw call. Every other case resolves at `panelDeadline` to `FreelancerWins (NoPanel)` with
+`F` credited to the client, no penalties, and all reservations released.
 
 ### Fuzz
 
 | ID | Case |
 | --- | --- |
-| CF-01 | Sampled `disputeFee`, `seatLock`, reveal counts: conservation `rewards + recipient = F + P · L` |
-| CF-02 | Sampled times around every court boundary: exactly the allowed action succeeds |
+| CF-01 | Sampled `F`, `L`, reveal patterns: `rewards + recipient + refund == F + P·L` |
+| CF-02 | Sampled times and block numbers around every court boundary: exactly the allowed action succeeds |
 
-### Invariants (handler: open, draw, commit, reveal, warp, resolve, claim, deposit, withdraw, donate)
+### Invariants (handler: open, retry, draw, commit, reveal, warp, roll, resolve, claim, deposit, withdraw, donate)
 
 | ID | Property |
 | --- | --- |
-| CI-01 | `balanceOf(court) == pendingFees + totalClaimable + donations` |
-| CI-02 | `pendingFees == disputeFee · unresolvedDisputes` |
-| CI-03 | `registry.locked(a) == seatLock · openSeats(a)` for every account |
-| CI-04 | Resolved disputes never change ruling; `rulingOf` is `None` exactly for unresolved disputes |
-| CI-05 | Sum of all fees paid in == rewards claimed + rewards unclaimed + recipient credits + pending fees |
-| CI-06 | Every dispute reaches `Resolved` when the handler warps past `panelDeadline + COMMIT + REVEAL` and calls resolve (bounded terminal path) |
+| CI-01 | `feesReceived + penaltiesReceived == claimsPaid + pendingFees + totalClaimable` |
+| CI-02 | `balanceOf(court) == pendingFees + totalClaimable + donations` |
+| CI-03 | `pendingFees == F · #(unresolved disputes)` |
+| CI-04 | `court.penaltiesReceived == registry.penaltiesSent` |
+| CI-05 | `registry.locked(a) == L · #(Locked seats of a in unresolved disputes)` and `reserved(a) == L · #(Reserved candidacies of a)` |
+| CI-06 | A resolved ruling never changes; `rulingOf` is `(None, None)` exactly for unresolved disputes |
+| CI-07 | Every dispute reaches `Resolved` once the handler warps past `panelDeadline + COMMIT + REVEAL` and calls resolve |
 
 ## 5. Slice S4 — integration
 
@@ -174,91 +202,116 @@ forms only with at least 3 eligible accounts and a draw call; every other case r
 
 | ID | Case |
 | --- | --- |
-| I-01 | Factory constructor deploys court and registry; `factory.court().factory() == factory`; `court.registry().court() == court`; parameters wired |
-| I-02 | `isWorkOrder` true for factory-created orders, false for arbitrary addresses and directly deployed `WorkOrder` contracts |
-| I-03 | `openDispute` by non-client reverts `NotClient`; on `Unfunded`, `Completed`, `Terminated`, `Disputed` reverts `InvalidOrderStatus` |
-| I-04 | `openDispute` on a `Pending` milestone reverts `InvalidMilestoneStatus`; on a non-current index reverts `NotCurrentMilestone` |
-| I-05 | Dispute at `reviewDeadline - 1` succeeds; at `reviewDeadline` reverts `ReviewPeriodElapsed`, and finalization succeeds instead |
-| I-06 | Race at `reviewDeadline - 1` in one block: approve then dispute (dispute reverts), and dispute then approve (approve reverts); same for signed approval |
-| I-07 | Race at `reviewDeadline`: dispute reverts in either order; finalize and approve each settle once |
-| I-08 | `openDispute` increments `approvalNonce`; `DisputeOpened` reports the consumed nonce |
-| I-09 | Stale signatures after dispute: signature for the disputed milestone fails; pre-signed signature for milestone `k+1` with nonce `k+1` fails on status; both still fail after `applyRuling` |
-| I-10 | Missing court allowance: `openDispute` reverts and order state, nonce and balances are unchanged |
-| I-11 | While `Disputed`, every blocked function in §3.5 reverts `InvalidOrderStatus(Disputed)` |
-| I-12 | `applyRuling` before `resolve` reverts `RulingNotReady`; after, credits per §11.1; second call reverts |
-| I-13 | `claimPayout` for client, freelancer, fee recipient: exact amounts; zero claim reverts; blocklisted freelancer's claim reverts while client and fee recipient claim successfully; retry after unblocking succeeds |
-| I-14 | `claimPayout` called by a third party pays the account, not the caller |
-| I-15 | Fee recipient equal to client: credits accumulate in one entry and conservation holds |
-| I-16 | ERC-1271 client opens a dispute (contract wallet approves the court) |
-| I-17 | Reentrancy: `ReentrantToken` as order token during `claimPayout` re-entering claims and `applyRuling`; as court token during the fee pull re-entering `openDispute` and order functions: blocked |
-| I-18 | Donations to order, court and registry during a dispute change no liability and no credit |
-| I-19 | Bytecode: `forge build --sizes` within EIP-170 runtime and EIP-3860 initcode limits |
+| I-01 | Factory deploys court and registry; `court.factory() == factory`; `registry.court() == court`; parameters wired |
+| I-02 | `isWorkOrder` true for factory orders; false for arbitrary addresses and directly deployed `WorkOrder` contracts |
+| I-03 | `createWorkOrder` with `penaltyRecipient` as caller, freelancer or fee recipient reverts `PenaltyRecipientIsParty` |
+| I-04 | `openDispute` by non-client reverts `NotClient`; on `Unfunded`, `Completed`, `Terminated`, `Disputed` reverts `InvalidOrderStatus` |
+| I-05 | `openDispute` on a `Pending` milestone reverts `InvalidMilestoneStatus`; on a non-current index `NotCurrentMilestone` |
+| I-06 | Dispute at `reviewDeadline - 1` succeeds; at `reviewDeadline` reverts `ReviewPeriodElapsed` and finalization succeeds |
+| I-07 | Race at `reviewDeadline - 1` in one block: approve then dispute (dispute reverts) and dispute then approve (approve reverts); same with signed approval |
+| I-08 | Race at `reviewDeadline`: dispute reverts in either order; finalize and approve each settle once |
+| I-09 | `openDispute` increments `approvalNonce`; `DisputeOpened` reports the consumed nonce |
+| I-10 | Stale signatures: the disputed milestone's signature fails; a pre-signed `(k+1, nonce k+1)` signature fails on status; both still fail after `applyRuling` |
+| I-11 | Missing court allowance: `openDispute` reverts; order state, nonce, balances and court counters unchanged |
+| I-12 | While `Disputed`, every function in §3.5 reverts `InvalidOrderStatus(Disputed)` |
+| I-13 | `applyRuling` before `resolve` reverts `RulingNotReady`; after, credits per §11.1 for each reason; second call reverts |
+| I-14 | Claims for client, freelancer, fee recipient; blocklisted freelancer's claim reverts while the others succeed; retry after unblocking |
+| I-15 | Fee recipient equal to client: credits accumulate in one entry; conservation holds |
+| I-16 | ERC-1271 client opens a dispute (wallet approves the court) |
+| I-17 | Reentrancy: `ReentrantToken` as order token during claims re-entering claims and `applyRuling`; as stake token during the fee pull re-entering `openDispute` and order functions: blocked |
+| I-18 | Donations to order, court and registry during a dispute change no liability, counter or credit |
+| I-19 | `forge build --sizes`: runtimes < 24,576 B; factory initcode < 49,152 B |
+| I-20 | **R2 regression:** empty court, `D = 1,000`, `F = 20`: dispute ends `FreelancerWins (NoPanel)`; freelancer `1000 - fee(1000)`, client receives `R` plus the 20 fee refund; client's net equals not disputing |
+| I-21 | Trace §11.5 step by step in `SharedToken` and `SplitToken`, asserting each equation after each step |
 
-### Matrix M3 — terminal outcome × dispute position (guaranteed)
+### Matrix M3 — ruling × dispute position (guaranteed, 15 cases)
 
-Rulings `{FreelancerWins, ClientWins, Split (NoDecision), Split (NoPanel), Split (zero reveals)}` × disputed milestone
-position `{first, middle, last}` = 15 cases on the `[1000, 2500, 500]` order with `feeBps = 250`. Each asserts the
-credits from §11.1, the claims, `outstanding == 0` after all claims, and order balance equal to donations.
+Rulings `{FreelancerWins (Majority), ClientWins (Majority), Split (NoDecision by tie), Split (NoDecision by zero
+reveals), FreelancerWins (NoPanel)}` × disputed milestone `{first, middle, last}` on `[1000, 2500, 500]`,
+`feeBps = 250`. Asserts §11.1 credits, all claims, `outstanding == 0` afterwards, order balance equal to donations.
 
-### Matrix M4 — terminal path × funding path (guaranteed)
+### Matrix M4 — terminal path × funding path (guaranteed, 21 cases)
 
-Funding `{fund, valid permit, failed permit with allowance}` × terminal path `{Completed, delivery expiry at first,
-delivery expiry at last, FreelancerWins, ClientWins, Split}` = 18 cases. Asserts the revised nonce invariant (§5.1)
-and total conservation.
+Funding `{fund, valid permit, failed permit with allowance}` × terminal path `{Completed, delivery expiry first,
+delivery expiry last, FreelancerWins (Majority), ClientWins, Split, FreelancerWins (NoPanel)}`. Asserts the revised
+nonce invariant and `fundedTotal == directPaid + claimsPaid + outstanding` at every step.
 
-### Matrix M5 — settlement path per milestone (guaranteed)
+### Matrix M5 — settlement path per milestone (guaranteed, 27 cases)
 
-For a 3-milestone order, every assignment of `{direct, signed, timeout}` to the three milestones = 27 cases, each
-ending in `Completed`, asserting `approvalNonce == 3` and fees. This replaces the Stage 2 claim of "all combinations"
-with an actual enumeration.
+Every assignment of `{direct, signed, timeout}` to three milestones, ending `Completed`, asserting
+`approvalNonce == 3`, fees and `directPaid`.
 
 ### Matrix M6 — boundaries (guaranteed)
 
-For each boundary in §4: `{t - 1, t, t + 1}` × each competing action. Expected success/revert is tabulated in the
-test and must match §4 exactly.
+Each boundary in §4 at `{t - 1, t, t + 1}` × each competing action. Expected success or revert is tabulated in the
+test and must match §4.
+
+### Matrix M7 — token configuration (guaranteed, 2 × 7 cases)
+
+`{SharedToken, SplitToken}` × the terminal paths of M4 with `fund`. Asserts the per-contract balance equations of
+§11.4 and the transfer-edge table: handler ghosts record every transfer by (from, to, transition); any transfer not
+listed in §11.4 fails the test.
 
 ### Fuzz
 
 | ID | Case |
 | --- | --- |
-| IF-01 | Sampled milestone amounts (including amounts near `type(uint256).max` in a separate deterministic case), `feeBps`, disputed index and ruling: credits sum to `D + R`, fee formula independent of `WorkOrder.feeFor` |
-| IF-02 | Sampled lifecycle: funding path, settlements before the dispute, and terminal path; revised nonce invariant and conservation at every step |
+| IF-01 | Sampled milestone amounts, `feeBps`, disputed index and ruling: credits sum to `D + R`; fee computed independently of `WorkOrder.feeFor`. Amounts near `type(uint256).max` are a separate deterministic case |
+| IF-02 | Sampled lifecycle across funding paths, settlements before the dispute and terminal paths: nonce invariant and all §11.4 equations after every step |
 
-### Invariants (handler covers order, court and registry actions together)
+### Invariants (handler covers order, court and registry actions; run in both token configurations)
 
 | ID | Property |
 | --- | --- |
-| II-01 | Order: `balanceOf(order) == outstandingObligations + donations` |
-| II-02 | Order `Active`/`Disputed`: `outstanding == sum(unsettled milestone amounts)`; `Terminated`: `outstanding == sum(claimable)` |
-| II-03 | Revised nonce invariant (§5.1) |
-| II-04 | Total funded == settled payouts + claimed credits + unclaimed credits + refunds (per order) |
-| II-05 | Court and registry invariants CI-01…CI-03, RI-01…RI-04 hold with real orders |
-| II-06 | An order has at most one dispute; `disputeId != 0` iff status is `Disputed` or terminated by ruling |
-| II-07 | No escrow token ever appears in court or registry balances, and no stake token ever enters an order, beyond donations |
+| II-01 | Order: `fundedTotal == directPaid + claimsPaid + outstandingObligations` |
+| II-02 | Order: `balanceOf(order) == outstandingObligations + orderDonations` |
+| II-03 | `outstandingObligations` per status as defined in §3.1 |
+| II-04 | Revised nonce invariant (§5.1) |
+| II-05 | Court: CI-01, CI-02, CI-04 |
+| II-06 | Registry: RI-01 … RI-06 |
+| II-07 | Provenance: every token transfer observed by the handler ghosts matches one edge of §11.4; per-contract cumulative inflows minus outflows equal that contract's liabilities |
+| II-08 | An order has at most one dispute; `disputeId != 0` iff status is `Disputed` or terminated by ruling |
 
-Invariant reports list, per campaign: terminal states reached, rulings by kind, funding paths, settlement paths,
-rejected stale signatures, re-arms, and faults. They are reported as sampled counts.
+Invariant reports list per campaign: terminal states, rulings by reason, funding and settlement paths, rejected stale
+signatures, snapshot retries, re-arms and faults, all as sampled counts.
 
 ## 6. Requirement traceability
 
 | Requirement | Cases |
 | --- | --- |
-| Every transition and deadline boundary | D-02…D-06, C-04…C-17, I-05…I-07, M6 |
-| Unauthorized operations | D-07, R-10, C-02, C-10, I-03 |
-| Dispute vs approval/finalization races | I-06, I-07, M6 |
-| Stale signatures after dispute transitions | D-12, I-08, I-09 |
-| Concurrent stake locks and withdrawal attempts | R-08, R-09, R-12, C-22, RI-01, RI-02 |
-| Missing arbitrators, commits and reveals | R-14, C-07, C-08, M1, M2 |
-| Tie and fallback outcomes | M1, M2, M3 |
-| Repeated resolution, application, claims | C-09, C-17, C-20, I-12, I-13 |
-| Failed transfers and callbacks | D-10, D-11, R-20, C-20, C-21, C-23, I-13, I-17 |
-| Conservation of escrow, stake and fee liabilities | RI-03…RI-05, CI-01, CI-02, CI-05, II-01…II-04, M1, M3, M4 |
+| Every transition and deadline boundary | D-02…D-06, R-05, C-04…C-20, I-06…I-08, M6 |
+| Unauthorized operations | D-07, R-04, R-12, C-02, C-13, I-03, I-04 |
+| Dispute vs approval/finalization races | I-07, I-08, M6 |
+| Stale signatures after dispute transitions | D-15, I-09, I-10 |
+| Snapshot integrity and concurrent stake | R-13…R-18, C-08, C-09, C-25, RI-01, RI-02, CI-05 |
+| Admission, cleanup and duplicate release | R-02, R-03, R-08…R-11, R-20…R-23 |
+| Missing arbitrators, commits and reveals | R-14, C-04…C-06, C-10, C-11, M1, M2 |
+| Tie and fallback outcomes | M1, M2, M3, I-20 |
+| Repeated resolution, application, claims | C-12, C-20, C-23, D-09, I-13, I-14 |
+| Failed transfers and callbacks | D-11, D-14, R-26, C-23, C-24, C-27, I-14, I-17 |
+| Conservation of escrow, stake and fee liabilities | DI-01, RI-04, CI-01, CI-04, II-01, II-05…II-07, I-21, M7 |
+| Shared and different token configurations | I-21, M7, II-01…II-08 |
 
 ## 7. Slice acceptance
 
-A slice is accepted only when all of the following are reported with actual command output:
+A slice is accepted only when all of the following are reported from actual command output:
 
-- `forge fmt --check`, `forge build` (with warnings listed), `forge test`, `forge coverage`;
-- every case ID of the slice present and passing, plus all earlier suites unchanged in intent;
+- `forge fmt --check`, `forge build` (warnings listed), `forge test`, `forge coverage`;
+- every case ID of the slice present and passing, and all earlier suites unchanged in intent;
 - 100% line and branch coverage for the slice's production contracts, or each uncovered line explained;
-- matrices reported as enumerated counts (for example "M1: 125/125"), fuzz and invariant results reported as sampled.
+- matrices as enumerated counts; fuzz and invariant results as sampled;
+- gas targets of §7.5 for S2 and S3, and size limits for S4.
+
+## 8. Changes from revision 1
+
+| Revision 1 | Revision 2 | Finding |
+| --- | --- | --- |
+| R-02, R-09 withdrawal delay and pending-withdrawal cases | removed; R-07, R-09 (penalty regression), R-17 | R1, R3 |
+| R-13/R-16/R-17 weighted walk | R-13…R-19 snapshot, reservation, uniform selection; M0 Sybil example | R1, R4 |
+| no admission case | R-02, R-03, R-04 | R3 |
+| no duplicate/unknown release case | R-20, R-21 | R3 |
+| M2 expected `Split (NoPanel)` | M2 expects `FreelancerWins (NoPanel)` with fee refund; I-20 | R2 |
+| CI-05 without penalties | CI-01 with cumulative counters; CI-04 | R5 |
+| II-04 without outstanding obligations | II-01 `fundedTotal == directPaid + claimsPaid + outstanding` | R5 |
+| II-07 by token address | II-07 transfer-edge provenance; M7; both token configurations | R5 |
+| D-08/D-10 pushed refund | D-06, D-08…D-12 credit and claim in S1 | R6 |
