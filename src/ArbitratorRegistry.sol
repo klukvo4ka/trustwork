@@ -19,6 +19,9 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
     uint256 public constant ACTIVATION_DELAY = 2 days;
     uint256 public constant MAX_ARBITRATORS = 32;
     uint256 public constant PANEL_SIZE = PanelSelection.PANEL_SIZE;
+    /// @notice Upper bound on one account's `stake + warming`, so that maturing warming into `stake` cannot overflow
+    /// the packed `uint128` fields.
+    uint256 public constant MAX_PRINCIPAL = type(uint128).max;
 
     IERC20 public immutable stakeToken;
     address public immutable court;
@@ -60,6 +63,7 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
     error RegistryFull();
     error InsufficientFreeStake(uint256 requested, uint256 available);
     error DepositMismatch(uint256 expected, uint256 received);
+    error PrincipalLimitExceeded(uint256 amount, uint256 capacity);
     error InvalidSnapshotState(uint256 disputeId, SnapshotState state);
     error UnknownSeat(uint256 disputeId, uint256 candidateIndex);
     error PenaltyTooHigh(uint256 penalty, uint256 seatLock);
@@ -84,17 +88,20 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
 
     /// @notice Adds `amount` to the caller's warming stake, which can back candidacies from
     /// `block.timestamp + ACTIVATION_DELAY`. A new deposit restarts the delay for all stake still warming.
-    /// @dev An unlisted account is listed only if its principal reaches `seatLock` and a slot is free.
+    /// @dev An unlisted account is listed only if its principal reaches `seatLock` and a slot is free. The account's
+    /// `stake + warming` may never exceed `MAX_PRINCIPAL`.
     function deposit(uint256 amount) external nonReentrant {
         if (msg.sender == penaltyRecipient) revert PenaltyRecipientCannotStake();
         if (amount == 0) revert ZeroAmount();
 
         Ledger storage account = _accounts[msg.sender];
         _mature(account);
+        uint256 principal = uint256(account.stake) + account.warming;
+        uint256 capacity = MAX_PRINCIPAL - principal;
+        if (amount > capacity) revert PrincipalLimitExceeded(amount, capacity);
         bool listing = !account.listed;
         if (listing) {
-            uint256 principal = uint256(account.stake) + account.warming + amount;
-            if (principal < seatLock) revert BelowListingMinimum(principal, seatLock);
+            if (principal + amount < seatLock) revert BelowListingMinimum(principal + amount, seatLock);
             if (_listed.length == MAX_ARBITRATORS) revert RegistryFull();
         }
 

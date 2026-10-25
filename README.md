@@ -324,6 +324,12 @@ its own penalties; any other contract is accepted). There is no owner, setter, p
   use an exact balance check; the penalty recipient cannot deposit.
 - An unlisted account is listed only if its principal after the deposit is at least `seatLock` and fewer than 32
   accounts are listed (`BelowListingMinimum`, `RegistryFull`).
+- **Principal limit.** One account's `stake + warming` may never exceed `MAX_PRINCIPAL = type(uint128).max`. A
+  deposit larger than the remaining capacity `MAX_PRINCIPAL - (stake + warming)` reverts with
+  `PrincipalLimitExceeded(amount, capacity)`. The check is done in `uint256` against the remaining capacity, so any
+  `uint256` amount, including `type(uint256).max`, gets that error rather than an arithmetic panic. The limit exists
+  because amounts are stored as `uint128` (see Gas below): without it, maturing warming stake into `stake` could
+  overflow and block withdrawals and snapshots for that account.
 - `withdraw(amount)` pays out at most `stake - locked - reserved`, with no delay. Any withdrawal or penalty that drops
   `stake + warming` below `seatLock` delists the account by swap-and-pop; its remaining balance stays withdrawable.
 
@@ -343,18 +349,21 @@ the court, and rejects unknown disputes, out-of-range indexes and seats that are
 **Accounting.** `totalStaked == sum(stake + warming)`, `depositsReceived == withdrawalsPaid + penaltiesSent +
 totalStaked`, and the token balance equals `totalStaked` plus unsolicited transfers, which create no principal.
 
-**Gas** (32 candidates, half with matured warming stake to materialize; storage marked cold with `vm.cool` before each
-call; measured as the external call into the court harness, excluding the 21,000 intrinsic cost and calldata):
+**Gas** (`test/registry/ArbitratorRegistry.gas.t.sol`; 32 candidates; registry and court-harness storage marked cold
+with `vm.cool` before each measured call, address warmth not reset; measured with `vm.lastCallGas` as the external
+call into the court harness, including its forwarding call and excluding the 21,000 intrinsic cost and calldata):
 
-| Operation | Measured | Target |
-| --- | --- | --- |
-| `reserveCandidates` | 1,580,724 | ≤ 2,000,000 |
-| `selectPanel` | 245,173 | ≤ 800,000 |
-| `releaseReservations` | 170,399 | ≤ 800,000 |
+| Operation | Mixed fixture (16 matured warming, 16 materialized) | All-warming fixture (32 matured warming) | Target |
+| --- | --- | --- | --- |
+| `reserveCandidates` | 1,580,835 | 1,915,251 | ≤ 2,000,000 |
+| `selectPanel` | 245,173 | 205,373 | ≤ 800,000 |
+| `releaseReservations` | 170,399 | 180,943 | ≤ 800,000 |
 
-The first measurement was 2,284,500 for the snapshot. Packing account fields into three storage slots (`stake` with
-`reserved`, `warming` with `locked`, `warmingUntil` with `listed`) brought it under the target without changing
-behavior; the public `accountOf` view still returns `uint256` amounts.
+An unpacked layout measured 2,284,500 for the mixed snapshot. Account fields are therefore packed into three storage
+slots: `stake` with `reserved`, `warming` with `locked`, and `warmingUntil` with `listed`, all amounts as `uint128`.
+Packing is not free of behavioral consequences. It introduces the per-account principal limit above, and `seatLock`
+must fit in `uint128`. The public `accountOf` view still returns `uint256` amounts. The all-warming snapshot leaves
+about 4% headroom under its target.
 
 ## Development
 

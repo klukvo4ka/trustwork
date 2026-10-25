@@ -567,12 +567,24 @@ caller can choose *which* candidate set is captured, though not the seed it will
 Targets are acceptance criteria for slices S2–S3. Snapshot storage is 1 slot per candidate per dispute and is not
 deleted (it serves as history).
 
-S2 measurements (32 candidates, half of them with matured warming stake that the snapshot materializes; registry and
-harness storage marked cold with `vm.cool`; external call into the court harness, excluding intrinsic and calldata
-cost): `reserveCandidates` 1,580,724, `selectPanel` 245,173, `releaseReservations` 170,399. Meeting the snapshot target
-required packing the account into three slots (`uint128` amounts, `stake` with `reserved`, `warming` with `locked`,
-`warmingUntil` with `listed`); `seatLock` must therefore fit in `uint128`. The `Account` view in section 6.3 keeps
-`uint256` fields. The court-level targets for `openDispute`, `drawPanel` and `resolve` remain for S3.
+S2 measurements (32 candidates; registry and harness storage marked cold with `vm.cool`; external call into the court
+harness, excluding intrinsic and calldata cost):
+
+| Operation | Mixed (16 matured warming, 16 materialized) | All 32 matured warming | Target |
+| --- | --- | --- | --- |
+| `reserveCandidates` | 1,580,835 | 1,915,251 | ≤ 2,000,000 |
+| `selectPanel` | 245,173 | 205,373 | ≤ 800,000 |
+| `releaseReservations` | 170,399 | 180,943 | ≤ 800,000 |
+
+Meeting the snapshot target required packing the account into three slots (`uint128` amounts, `stake` with
+`reserved`, `warming` with `locked`, `warmingUntil` with `listed`). That layout has two consequences:
+
+- `seatLock` must fit in `uint128`.
+- Each account's `stake + warming` is bounded by `MAX_PRINCIPAL = type(uint128).max`. `deposit` computes the remaining
+  capacity `MAX_PRINCIPAL - (stake + warming)` in `uint256` and rejects any larger amount with
+  `PrincipalLimitExceeded(amount, capacity)`, so maturation, withdrawal and snapshots can never overflow.
+
+The `Account` view in section 6.3 keeps `uint256` fields. The court-level targets for `openDispute`, `drawPanel` and `resolve` remain for S3.
 
 Selection is implemented in `PanelSelection.selectIndexes(seed, n)`, which reverts with `TooFewCandidates` for
 `n < 3`; the registry takes the seed from the court and never fetches block data.

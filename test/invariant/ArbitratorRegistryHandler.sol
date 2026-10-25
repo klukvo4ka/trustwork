@@ -10,6 +10,7 @@ import {RegistryCourtHarness} from "../mocks/RegistryCourtHarness.sol";
 contract ArbitratorRegistryHandler is Test {
     uint256 public constant ACTOR_COUNT = 6;
     uint256 internal constant ACTIVATION_DELAY = 2 days;
+    uint256 internal constant MAX_PRINCIPAL = type(uint128).max;
 
     struct Ghost {
         uint256 stake;
@@ -62,6 +63,9 @@ contract ArbitratorRegistryHandler is Test {
     uint256 public seatReleases;
     uint256 public penalizedReleases;
     uint256 public rejectedReleases;
+    uint256 public boundaryDeposits;
+    uint256 public rejectedAtLimit;
+    uint256 public reachedLimit;
 
     constructor(RegistryCourtHarness court_, MockUSDC token_, address[3] memory parties_) {
         court = court_;
@@ -82,6 +86,16 @@ contract ArbitratorRegistryHandler is Test {
         token.mint(actor, amount);
         vm.startPrank(actor);
         token.approve(address(registry), amount);
+        uint256 capacity = MAX_PRINCIPAL - (ghost.stake + ghost.warming);
+        if (amount > capacity) {
+            vm.expectRevert(
+                abi.encodeWithSelector(ArbitratorRegistry.PrincipalLimitExceeded.selector, amount, capacity)
+            );
+            registry.deposit(amount);
+            vm.stopPrank();
+            ++rejectedAtLimit;
+            return;
+        }
         uint256 principal = ghost.stake + ghost.warming + amount;
         if (!ghost.listed && principal < seatLock) {
             vm.expectRevert(
@@ -98,6 +112,45 @@ contract ArbitratorRegistryHandler is Test {
         ghost.warmingUntil = block.timestamp + ACTIVATION_DELAY;
         ghostDeposits += amount;
         ++deposits;
+        if (!ghost.listed) {
+            ghost.listed = true;
+            ghostListing.push(actor);
+            ++listings;
+        }
+    }
+
+    function depositNearLimit(uint256 actorSeed, uint256 offsetSeed, bool unbounded) external {
+        address actor = actors[actorSeed % ACTOR_COUNT];
+        Ghost storage ghost = ghosts[actor];
+        _matureGhost(ghost);
+        uint256 principal = ghost.stake + ghost.warming;
+        uint256 capacity = MAX_PRINCIPAL - principal;
+        uint256 amount = unbounded ? type(uint256).max - offsetSeed % 3 : capacity + offsetSeed % 5;
+        if (!unbounded) amount = amount > 2 ? amount - 2 : 1;
+        vm.startPrank(actor);
+        token.approve(address(registry), type(uint256).max);
+        if (amount > capacity) {
+            vm.expectRevert(
+                abi.encodeWithSelector(ArbitratorRegistry.PrincipalLimitExceeded.selector, amount, capacity)
+            );
+            registry.deposit(amount);
+            vm.stopPrank();
+            ++rejectedAtLimit;
+            return;
+        }
+        if (!ghost.listed && principal + amount < seatLock) {
+            vm.stopPrank();
+            return;
+        }
+        vm.stopPrank();
+        token.mint(actor, amount);
+        vm.prank(actor);
+        registry.deposit(amount);
+        ghost.warming += amount;
+        ghost.warmingUntil = block.timestamp + ACTIVATION_DELAY;
+        ghostDeposits += amount;
+        ++boundaryDeposits;
+        if (principal + amount == MAX_PRINCIPAL) ++reachedLimit;
         if (!ghost.listed) {
             ghost.listed = true;
             ghostListing.push(actor);

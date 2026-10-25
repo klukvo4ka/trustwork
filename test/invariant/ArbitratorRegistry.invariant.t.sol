@@ -20,6 +20,13 @@ contract ArbitratorRegistryInvariantTest is StdInvariant, RegistryTestBase {
         targetContract(address(handler));
     }
 
+    function invariant_PrincipalWithinLimit() public view {
+        for (uint256 i; i < handler.ACTOR_COUNT(); ++i) {
+            IArbitratorRegistry.Account memory account = _account(handler.actors(i));
+            assertLe(uint256(account.stake) + account.warming, registry.MAX_PRINCIPAL());
+        }
+    }
+
     function invariant_CommitmentsNeverExceedStake() public view {
         for (uint256 i; i < handler.ACTOR_COUNT(); ++i) {
             IArbitratorRegistry.Account memory account = _account(handler.actors(i));
@@ -126,7 +133,13 @@ contract ArbitratorRegistryInvariantTest is StdInvariant, RegistryTestBase {
                     " penalized=",
                     vm.toString(handler.penalizedReleases()),
                     " rejectedReleases=",
-                    vm.toString(handler.rejectedReleases())
+                    vm.toString(handler.rejectedReleases()),
+                    " boundaryDeposits=",
+                    vm.toString(handler.boundaryDeposits()),
+                    " rejectedAtLimit=",
+                    vm.toString(handler.rejectedAtLimit()),
+                    " reachedLimit=",
+                    vm.toString(handler.reachedLimit())
                 )
             )
         );

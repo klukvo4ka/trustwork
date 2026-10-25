@@ -365,7 +365,8 @@ A slice is accepted only when all of the following are reported from actual comm
 
 Added in S2: R-27 (constructor validation, including `penaltyRecipient` equal to the court or the registry and a
 contract recipient accepted), R-28 (`seatLock` above `uint128`), R-29 (failed outgoing transfers roll back delisting,
-seat state and counters).
+seat state and counters). Added in the S2 corrective pass: R-30 (per-account principal limit), RF-04 (boundary fuzz
+around `type(uint128).max`), RI-08 (principal within limit) and an all-warming gas fixture for R-24.
 
 | Cases | Test (`test/registry/ArbitratorRegistry.t.sol` unless noted) |
 | --- | --- |
@@ -398,10 +399,14 @@ seat state and counters).
 | R-27 | `test_Constructor_StoresTermsAndDeployerIsCourt`, `test_RevertWhen_ConstructorInputsInvalid`, `test_RevertWhen_PenaltyRecipientIsCourt`, `test_RevertWhen_PenaltyRecipientIsRegistry`, `test_Constructor_AcceptsContractPenaltyRecipient` |
 | R-28 | `test_RevertWhen_SeatLockExceedsUint128` |
 | R-29 | `test_RevertWhen_WithdrawTransferFailsRollsBackDelisting`, `test_RevertWhen_PenaltyTransferFailsRollsBackRelease` |
+| R-30 | Principal limit, deterministic (`ArbitratorRegistry.principal.t.sol`): `test_PrincipalAtLimit_MaturesAndWithdraws`, `test_RevertWhen_TopUpAtMaturedLimit`, `test_MixedPrincipal_ExactCapacitySucceedsAndOneMoreFails`, `test_RepeatedTopUpsCannotBypassLimit`, `test_RevertWhen_DepositOversized`, `test_RejectedDeposit_PreservesAllState`, `test_AfterRejectedTopUp_WithdrawalsAndSnapshotsSucceed`, `test_MaxPrincipalConstant` |
+| RF-04 | Principal limit, fuzz: `testFuzz_DepositSequenceStaysWithinLimit`, `testFuzz_OversizedDepositRejectedWithoutChanges`, `testFuzz_NearLimitAccountStaysUsable` |
+| RI-08 | `invariant_PrincipalWithinLimit`; handler action `depositNearLimit` deposits remaining capacity ± 2 or an unbounded amount |
+| R-24 (all-warming) | `ArbitratorRegistry.gas.t.sol`: `ArbitratorRegistryAllWarmingGasTest.test_Gas_SnapshotSelectAndRelease` |
 | M0 | `ArbitratorRegistry.matrix.t.sol`: `test_MatrixM0_SplitStakeGainsSeats` (all 10 triples observed through registry draws), `test_MatrixM0_UnsplitStakeHoldsOneSeat` |
 | RF-01 | `ArbitratorRegistry.fuzz.t.sol`: `testFuzz_MatchesReferenceModel` |
 | RF-02 | `testFuzz_PanelComesFromStoredSnapshot` |
-| RF-03 | `testFuzz_SelectionFrequenciesAreNearUniform`, `test_PanelSelection_RevertWhen_FewerThanThreeCandidates` |
+| RF-03 | `testFuzz_SelectionFrequenciesAreNearUniform` (fuzz); `test_PanelSelection_RevertWhen_FewerThanThreeCandidates` is a deterministic test in the same file |
 | RI-01 | `test/invariant/ArbitratorRegistry.invariant.t.sol`: `invariant_CommitmentsNeverExceedStake` |
 | RI-02 | `invariant_CommitmentsMatchLiveCandidacies` |
 | RI-03 | `invariant_TotalStakedIsSumOfPrincipal` |

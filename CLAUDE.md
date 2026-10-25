@@ -39,6 +39,8 @@ Stage 3C (current): slice S2 — `ArbitratorRegistry`, `IArbitratorRegistry`, `P
 `RegistryCourtHarness`.
 
 - Immutable `court = msg.sender`; `penaltyRecipient` may not be the court or the registry; `seatLock` fits `uint128`.
+- Per-account `stake + warming <= MAX_PRINCIPAL = type(uint128).max`; larger deposits revert with
+  `PrincipalLimitExceeded(amount, capacity)`, computed against remaining capacity in `uint256`.
 - Stake buckets `stake`, `warming`, `reserved`, `locked`; listing minimum `seatLock`; at most 32 listed accounts;
   automatic delisting below `seatLock`.
 - Court-only snapshots reserve `seatLock` per candidate before any seed; failed snapshots write nothing; stored
