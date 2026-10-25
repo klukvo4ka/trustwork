@@ -2,8 +2,9 @@
 
 Milestone-based escrow for freelance work, written in Solidity with Foundry and OpenZeppelin Contracts v5.
 
-> **Status:** Stage 3E (orders integrated with the arbitration court) of a portfolio project. Unaudited and intended for local development and testnets only.
-> Do not use it with real funds.
+> **Status:** Stage 3 (escrow, arbitration and order integration) of a portfolio project is accepted. The Stage 4A
+> reputation design is proposed ([design](docs/stage-4-reputation-design.md), [test plan](docs/stage-4-test-plan.md))
+> and not implemented. Unaudited and intended for local development and testnets only. Do not use it with real funds.
 
 ## Architecture
 
@@ -627,7 +628,8 @@ Not implemented in this stage:
 - appeals, resubmission after a dispute, or more than one dispute per order;
 - cancellation by agreement, and any refund other than delivery-expiry reclaim;
 - recovery of unsolicited tokens sent directly to an order;
-- reputation, governance, frontend, deployment scripts, and a relayer service.
+- reputation and soulbound receipts (designed in [`docs/stage-4-reputation-design.md`](docs/stage-4-reputation-design.md),
+  not implemented), governance, frontend, deployment scripts, and a relayer service.
 
 Stage 2 caveats:
 
