@@ -56,7 +56,7 @@ Stage 3D (accepted, `f243e4b`): slice S3 — `ArbitrationCourt`, `IArbitrationCo
   credits claimed through `claimReward`.
 - The registry's private storage keeps `principal = stake + warming`; its API and rules are unchanged.
 
-Stage 3E (current): slice S4 — production order and factory integration.
+Stage 3E (accepted, `8c55497`): slice S4 — production order and factory integration.
 
 - `TrustWorkFactory(stakeToken, disputeFee, seatLock, penaltyRecipient)` deploys its immutable court; `isWorkOrder`
   is true only for orders it created; `createWorkOrder` keeps its parameters, passes the court to the order and
@@ -70,10 +70,14 @@ Stage 3E (current): slice S4 — production order and factory integration.
 - `approvalNonce == settledCount + (Disputed || Terminated ? 1 : 0)`; EIP-712 message and domain unchanged.
 - `ArbitrationCourt`, `ArbitratorRegistry`, their interfaces and `PanelSelection` are unchanged.
 
-Out of scope until a later stage explicitly asks for it: appeals, resubmission or continuation after a dispute;
-cancellation by agreement and other refunds; recovery of unsolicited tokens, reputation, governance, frontend,
-deployment scripts (Base Sepolia comes later), and any relayer service. Do not add placeholder functions or hooks
-for these.
+Stage 4A (current): design only — reputation and soulbound receipts in `docs/stage-4-reputation-design.md` and
+`docs/stage-4-test-plan.md`. No Solidity is authorized yet; implementation follows slices 4B and 4C, each authorized
+and reviewed separately.
+
+Out of scope until a later stage explicitly asks for it: implementation of the Stage 4 reputation design; appeals,
+resubmission or continuation after a dispute; cancellation by agreement and other refunds; recovery of unsolicited
+tokens, governance, frontend, deployment scripts (Base Sepolia comes later), and any relayer service. Do not add
+placeholder functions or hooks for these.
 
 ## Toolchain
 
