@@ -9,6 +9,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {IArbitrationCourt} from "./interfaces/IArbitrationCourt.sol";
 
 /// @title WorkOrder
 /// @notice Escrow for one client-freelancer engagement paid in ordered milestones.
@@ -20,6 +21,7 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     enum OrderStatus {
         Unfunded,
         Active,
+        Disputed,
         Completed,
         Terminated
     }
@@ -27,7 +29,8 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     enum MilestoneStatus {
         Pending,
         Submitted,
-        Settled
+        Settled,
+        Disputed
     }
 
     struct Milestone {
@@ -53,14 +56,18 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     uint256 public immutable reviewPeriod;
     uint256 public immutable deliveryPeriod;
     uint256 public immutable totalAmount;
+    IArbitrationCourt public immutable court;
 
     OrderStatus public status;
     uint256 public currentMilestone;
     /// @notice Funded amounts not yet paid out: unsettled milestones while active, unclaimed credits once
     /// terminated. Independent of the raw token balance.
     uint256 public outstandingObligations;
-    /// @notice Nonce a client approval signature must carry. Incremented by every settlement and by termination.
+    /// @notice Nonce a client approval signature must carry. Incremented by every settlement, by opening a dispute
+    /// and by delivery-expiry termination.
     uint256 public approvalNonce;
+    /// @notice Court dispute opened by this order; zero until `openDispute`.
+    uint256 public disputeId;
     /// @notice Gross milestone amounts paid through settlement, protocol fees included.
     uint256 public directPaid;
     /// @notice Amounts transferred through `claimPayout`.
@@ -80,6 +87,15 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     event OrderCompleted();
     event DeliveryExpired(uint256 indexed index, uint256 clientCredit);
     event PayoutClaimed(address indexed account, uint256 amount);
+    event DisputeOpened(uint256 indexed index, uint256 indexed disputeId, uint256 consumedNonce);
+    event RulingApplied(
+        uint256 indexed disputeId,
+        IArbitrationCourt.Ruling ruling,
+        IArbitrationCourt.RulingReason reason,
+        uint256 clientCredit,
+        uint256 freelancerCredit,
+        uint256 feeCredit
+    );
 
     error ZeroAddress();
     error ClientIsFreelancer();
@@ -103,6 +119,8 @@ contract WorkOrder is EIP712, ReentrancyGuard {
     error DeliveryPeriodElapsed(uint256 index, uint256 deliveryDeadline);
     error DeliveryPeriodNotElapsed(uint256 index, uint256 deliveryDeadline);
     error NothingToClaim(address account);
+    error ReviewPeriodElapsed(uint256 index, uint256 reviewDeadline);
+    error RulingNotReady(uint256 disputeId);
 
     constructor(
         address client_,
@@ -112,11 +130,12 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         uint256 feeBps_,
         uint256 reviewPeriod_,
         uint256 deliveryPeriod_,
+        IArbitrationCourt court_,
         uint256[] memory milestoneAmounts
     ) EIP712("TrustWork", "1") {
         if (
             client_ == address(0) || freelancer_ == address(0) || feeRecipient_ == address(0)
-                || address(token_) == address(0)
+                || address(token_) == address(0) || address(court_) == address(0)
         ) revert ZeroAddress();
         if (client_ == freelancer_) revert ClientIsFreelancer();
         if (feeRecipient_ == address(this)) revert FeeRecipientIsOrder();
@@ -151,6 +170,7 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         reviewPeriod = reviewPeriod_;
         deliveryPeriod = deliveryPeriod_;
         totalAmount = total;
+        court = court_;
     }
 
     /// @notice Deposits the full budget from the client. Requires prior ERC-20 approval of `totalAmount`.
@@ -241,6 +261,51 @@ contract WorkOrder is EIP712, ReentrancyGuard {
         claimable[client] += credit;
 
         emit DeliveryExpired(index, credit);
+    }
+
+    /// @notice Disputes the submitted current milestone, which ends the order once the court rules. Allowed only while
+    /// `block.timestamp < reviewDeadline`.
+    /// @dev The court pulls its dispute fee from the client, so the client must approve `court.disputeFee()` of the
+    /// court's stake token to the court. The order is `Disputed` and the nonce consumed before the court is called; a
+    /// failed court call reverts the whole transaction.
+    function openDispute(uint256 index) external nonReentrant {
+        if (msg.sender != client) revert NotClient(msg.sender);
+        Milestone storage milestone = _currentMilestone(index, MilestoneStatus.Submitted);
+        if (block.timestamp >= milestone.reviewDeadline) revert ReviewPeriodElapsed(index, milestone.reviewDeadline);
+
+        status = OrderStatus.Disputed;
+        milestone.status = MilestoneStatus.Disputed;
+        uint256 consumedNonce = approvalNonce++;
+        uint256 id = court.openDispute(index);
+        disputeId = id;
+
+        emit DisputeOpened(index, id, consumedNonce);
+    }
+
+    /// @notice Terminates a disputed order with the ruling the court recorded for this order's dispute and credits
+    /// the disputed and remaining amounts. Callable by anyone.
+    /// @dev Moves no tokens; every party collects its credit with `claimPayout`.
+    function applyRuling() external nonReentrant {
+        if (status != OrderStatus.Disputed) revert InvalidOrderStatus(status);
+        uint256 id = disputeId;
+        (IArbitrationCourt.Ruling ruling, IArbitrationCourt.RulingReason reason) = court.rulingOf(id);
+        if (ruling == IArbitrationCourt.Ruling.None) revert RulingNotReady(id);
+
+        uint256 disputed = _milestones[currentMilestone].amount;
+        uint256 remaining = outstandingObligations - disputed;
+        uint256 freelancerGross;
+        if (ruling == IArbitrationCourt.Ruling.FreelancerWins) freelancerGross = disputed;
+        else if (ruling == IArbitrationCourt.Ruling.Split) freelancerGross = disputed / 2;
+        uint256 feeCredit = feeFor(freelancerGross);
+        uint256 freelancerCredit = freelancerGross - feeCredit;
+        uint256 clientCredit = disputed - freelancerGross + remaining;
+
+        status = OrderStatus.Terminated;
+        claimable[client] += clientCredit;
+        claimable[freelancer] += freelancerCredit;
+        claimable[feeRecipient] += feeCredit;
+
+        emit RulingApplied(id, ruling, reason, clientCredit, freelancerCredit, feeCredit);
     }
 
     /// @notice Transfers the credit of `account` to `account`. Callable by anyone once the order is terminated.

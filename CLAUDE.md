@@ -46,30 +46,34 @@ test-only `RegistryCourtHarness`.
 - Court-only snapshots reserve `seatLock` per candidate before any seed; failed snapshots write nothing; stored
   snapshots never change; `locked + reserved <= stake`.
 
-Stage 3D (current): slice S3 — `ArbitrationCourt`, `IArbitrationCourt`, the minimal read interfaces `IOrderFactory`
-and `IOrderParties`, and the test-only `MockArbitrationFactory` and `MockDisputableOrder`.
+Stage 3D (accepted, `f243e4b`): slice S3 — `ArbitrationCourt`, `IArbitrationCourt`, the minimal read interfaces
+`IOrderFactory` and `IOrderParties`, and the test-only `MockArbitrationFactory` and `MockDisputableOrder`.
 
 - Immutable `factory = msg.sender`; the court deploys its own immutable `ArbitratorRegistry`; `penaltyRecipient` is
-  restricted only by the registry (not the court or the registry). No owner, pause, setters, upgrades or rescue
-  functions.
-- `openDispute` only from orders the factory recognizes; pulls exactly `disputeFee` from the order's client; snapshots
-  candidates excluding client, freelancer and fee recipient; `AwaitingCandidates` below three candidates, otherwise
-  `AwaitingSeed` with `selectionBlock = block.number + 10`. `retrySnapshot` only before `panelDeadline`.
-- `drawPanel` seeds from `blockhash(selectionBlock)`; an expired hash re-arms against the same snapshot.
-- Commit-reveal with `VOTE_TAG = keccak256("TrustWork.ArbitrationVote.v1")`; raw `uint8` votes; no early resolution.
-- `NoPanel` refunds the fee to the client as a credit; a panel ruling needs two matching reveals, otherwise `Split`;
-  every seat without a valid reveal loses exactly `seatLock`; fee shares `floor(F / r)`, dust and penalties to
-  `penaltyRecipient`; all payouts are credits claimed through `claimReward`.
-- `feesReceived + penaltiesReceived == claimsPaid + pendingFees + totalClaimable`,
-  `pendingFees == disputeFee * unresolved`, `penaltiesReceived == registry.penaltiesSent`.
-- The registry's API and rules are unchanged; the corrective pass changed only its private storage to keep
-  `principal = stake + warming` (matured stake derived as `principal - warming`) to meet the gas targets.
-- `WorkOrder` and `TrustWorkFactory` are unchanged and do not use the court.
+  restricted only by the registry (not the court or the registry).
+- Snapshot at opening, blockhash-seeded draw with expiry re-arm, commit-reveal with
+  `VOTE_TAG = keccak256("TrustWork.ArbitrationVote.v1")`, `NoPanel`/`Majority`/`Split` rulings, seat penalties,
+  credits claimed through `claimReward`.
+- The registry's private storage keeps `principal = stake + warming`; its API and rules are unchanged.
 
-Out of scope until a later stage explicitly asks for it: order or factory integration with the court (slice S4) and
-their constructor arguments, `applyRuling` and order-side dispute state; cancellation by agreement and other refunds;
-recovery of unsolicited tokens, reputation, governance, frontend, deployment scripts (Base Sepolia comes later), and
-any relayer service. Do not add placeholder arbitration functions or hooks.
+Stage 3E (current): slice S4 — production order and factory integration.
+
+- `TrustWorkFactory(stakeToken, disputeFee, seatLock, penaltyRecipient)` deploys its immutable court; `isWorkOrder`
+  is true only for orders it created; `createWorkOrder` keeps its parameters, passes the court to the order and
+  rejects `penaltyRecipient` as client, freelancer or fee recipient (`PenaltyRecipientIsParty`).
+- `WorkOrder` takes an immutable nonzero `court`; `OrderStatus.Disputed`, `MilestoneStatus.Disputed`, `disputeId`.
+- `openDispute(index)`: client, `Active`, current `Submitted` milestone, `block.timestamp < reviewDeadline`; sets
+  `Disputed`, consumes one nonce, then calls `court.openDispute`, which pulls the fee from the client. Any failure
+  reverts the whole call. While `Disputed` every state-changing order function except `applyRuling` reverts.
+- `applyRuling()`: anyone, reads the court's ruling for the stored `disputeId`, sets `Terminated`, credits per design
+  §11.1 without moving tokens; payouts through `claimPayout`.
+- `approvalNonce == settledCount + (Disputed || Terminated ? 1 : 0)`; EIP-712 message and domain unchanged.
+- `ArbitrationCourt`, `ArbitratorRegistry`, their interfaces and `PanelSelection` are unchanged.
+
+Out of scope until a later stage explicitly asks for it: appeals, resubmission or continuation after a dispute;
+cancellation by agreement and other refunds; recovery of unsolicited tokens, reputation, governance, frontend,
+deployment scripts (Base Sepolia comes later), and any relayer service. Do not add placeholder functions or hooks
+for these.
 
 ## Toolchain
 

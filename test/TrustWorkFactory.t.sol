@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {WorkOrder} from "../src/WorkOrder.sol";
+import {IArbitrationCourt} from "../src/interfaces/IArbitrationCourt.sol";
 import {WorkOrderTestBase} from "./utils/WorkOrderTestBase.sol";
 
 contract TrustWorkFactoryTest is WorkOrderTestBase {
@@ -31,6 +32,9 @@ contract TrustWorkFactoryTest is WorkOrderTestBase {
         assertEq(order.currentMilestone(), 0);
         assertEq(order.outstandingObligations(), 0);
         assertEq(order.milestoneCount(), amounts.length);
+        assertEq(address(order.court()), address(factory.court()));
+        assertEq(order.disputeId(), 0);
+        assertTrue(factory.isWorkOrder(address(order)));
 
         for (uint256 i; i < amounts.length; ++i) {
             WorkOrder.Milestone memory milestone = order.getMilestone(i);
@@ -172,6 +176,7 @@ contract TrustWorkFactoryTest is WorkOrderTestBase {
     }
 
     function test_RevertWhen_DirectlyDeployedOrderIsOwnFeeRecipient() public {
+        IArbitrationCourt court = factory.court();
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
 
         vm.expectRevert(WorkOrder.FeeRecipientIsOrder.selector);
@@ -183,6 +188,7 @@ contract TrustWorkFactoryTest is WorkOrderTestBase {
             DEFAULT_FEE_BPS,
             DEFAULT_REVIEW_PERIOD,
             DEFAULT_DELIVERY_PERIOD,
+            court,
             _defaultAmounts()
         );
     }
@@ -207,6 +213,7 @@ contract TrustWorkFactoryTest is WorkOrderTestBase {
     }
 
     function test_RevertWhen_WorkOrderDeployedDirectlyWithZeroClient() public {
+        IArbitrationCourt court = factory.court();
         vm.expectRevert(WorkOrder.ZeroAddress.selector);
         new WorkOrder(
             address(0),
@@ -216,6 +223,22 @@ contract TrustWorkFactoryTest is WorkOrderTestBase {
             DEFAULT_FEE_BPS,
             DEFAULT_REVIEW_PERIOD,
             DEFAULT_DELIVERY_PERIOD,
+            court,
+            _defaultAmounts()
+        );
+    }
+
+    function test_RevertWhen_WorkOrderDeployedDirectlyWithZeroCourt() public {
+        vm.expectRevert(WorkOrder.ZeroAddress.selector);
+        new WorkOrder(
+            client,
+            freelancer,
+            usdc,
+            feeRecipient,
+            DEFAULT_FEE_BPS,
+            DEFAULT_REVIEW_PERIOD,
+            DEFAULT_DELIVERY_PERIOD,
+            IArbitrationCourt(address(0)),
             _defaultAmounts()
         );
     }

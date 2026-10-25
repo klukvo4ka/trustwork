@@ -1,8 +1,8 @@
 # Stage 3 — Arbitration design
 
-Status: Stage 3A design (revision 2, accepted at `f0a1c1b`) with narrow corrections made during slice S1. Slice S1
-(Stage 3B) and the registry of slice S2 (Stage 3C) are implemented; sections describing the court and disputes are
-not.
+Status: Stage 3A design (revision 2, accepted at `f0a1c1b`) with narrow corrections made during slices S1 and S3.
+All four slices are implemented: S1 (Stage 3B), S2 (Stage 3C), S3 (Stage 3D) and S4 (Stage 3E, order and factory
+integration).
 Baseline: Stage 2, commit `5746ac19e947d4c72b5dbfcf518e4b05ba199165`. Revision 1: `8a3995e`. Section 15 maps the
 review findings R1–R6 to the sections that resolve them.
 
@@ -231,9 +231,10 @@ TrustWorkFactory --constructor deploys--> ArbitrationCourt --constructor deploys
   `court.rulingOf(disputeId)`; it never accepts a ruling as an argument.
 - No contract has an owner, pause, parameter setter, upgrade hook or token-rescue function.
 
-Bytecode baseline (Stage 2 build): factory runtime 10,054 B, WorkOrder initcode 9,274 B. The factory's initcode will
-embed court and registry initcode and must stay under 49,152 B (EIP-3860); runtimes under 24,576 B (EIP-170). Slice
-S4 measures both.
+Bytecode baseline (Stage 2 build): factory runtime 10,054 B, WorkOrder initcode 9,274 B. The factory's initcode
+embeds court and registry initcode and must stay under 49,152 B (EIP-3860); runtimes under 24,576 B (EIP-170).
+S4 measurements (optimized build): factory runtime 13,668 B and initcode 34,735 B; `WorkOrder` runtime 9,849 B and
+initcode 12,427 B; court runtime 10,616 B; registry runtime 8,667 B.
 
 ### 6.2 Enforceable address restrictions
 
@@ -417,7 +418,9 @@ function claimPayout(address account) external returns (uint256 amount);
 
 `directPaid` accumulates every settlement transfer (O3–O5); `claimsPaid` accumulates every `claimPayout`. Both exist
 for the conservation equation in section 11.4. The constructor gains `IArbitrationCourt court_` and
-`uint256 deliveryPeriod_`, rejecting a zero court and an invalid delivery period.
+`uint256 deliveryPeriod_`, rejecting a zero court and an invalid delivery period. S4 places `court_` after
+`deliveryPeriod_` and before the milestone amounts:
+`(client, freelancer, token, feeRecipient, feeBps, reviewPeriod, deliveryPeriod, court, milestoneAmounts)`.
 
 `TrustWorkFactory` (Stage 3):
 
