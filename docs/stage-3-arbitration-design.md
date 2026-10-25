@@ -246,7 +246,6 @@ S4 measures both.
 | Client and freelancer differ | order constructor (Stage 1) | `ClientIsFreelancer` |
 | Fee recipient is not the order itself | order constructor (S1) | `FeeRecipientIsOrder` |
 | `penaltyRecipient` is neither the court nor the registry | registry constructor (S2) | `PenaltyRecipientIsProtocol` |
-| `penaltyRecipient` is not the factory | court constructor (S3) | `PenaltyRecipientIsFactory` |
 
 **Limitation.** These are address checks. Nothing on-chain can detect that different addresses share a controller:
 a party, an arbitrator and `penaltyRecipient` may be the same person behind different addresses.
@@ -573,9 +572,9 @@ harness, excluding intrinsic and calldata cost):
 
 | Operation | Mixed (16 matured warming, 16 materialized) | All 32 matured warming | Target |
 | --- | --- | --- | --- |
-| `reserveCandidates` | 1,580,835 | 1,915,251 | ≤ 2,000,000 |
+| `reserveCandidates` | 1,580,835 (S3 layout: 1,292,803) | 1,915,251 (S3 layout: 1,343,187) | ≤ 2,000,000 |
 | `selectPanel` | 245,173 | 205,373 | ≤ 800,000 |
-| `releaseReservations` | 170,399 | 180,943 | ≤ 800,000 |
+| `releaseReservations` | 180,943 (first reported as 170,399 for a 30-candidate snapshot) | 180,943 | ≤ 800,000 |
 
 Meeting the snapshot target required packing the account into three slots (`uint128` amounts, `stake` with
 `reserved`, `warming` with `locked`, `warmingUntil` with `listed`). That layout has two consequences:
@@ -593,19 +592,24 @@ intrinsic and calldata cost):
 
 | Operation | Mixed (16 materialized, 16 matured warming) | All 32 matured warming | Target |
 | --- | --- | --- | --- |
-| `openDispute`, first dispute | 1,835,772 | 2,170,188 (missed by 170,188) | ≤ 2,000,000 |
-| `openDispute`, after an earlier dispute | — | 1,993,488 | ≤ 2,000,000 |
-| successful `retrySnapshot` | 1,526,825 | 1,861,241 | ≤ 2,000,000 |
+| `openDispute`, first dispute | 1,547,740 | 1,598,124 | ≤ 2,000,000 |
+| `openDispute`, after an earlier dispute | — | 1,331,824 | ≤ 2,000,000 |
+| successful `retrySnapshot` | 1,193,993 | 1,199,577 | ≤ 2,000,000 |
 | `drawPanel` | 394,511 | 374,611 | ≤ 800,000 |
 | `resolve` with `NoPanel` from `AwaitingSeed` | 221,240 | 221,240 | ≤ 800,000 |
-| `resolve` with a panel (3 faulty seats / 3 reveals) | 204,259 / 176,856 | 201,459 / 176,856 | ≤ 400,000 |
+| `resolve` with a panel (3 faulty seats / 3 reveals) | 209,289 / 176,286 | 209,289 / 176,286 | ≤ 400,000 |
 
-The all-warming first `openDispute` misses its target: the S2 snapshot alone costs 1,911,409 there, leaving about
-85,000 gas for the fee pull, the dispute record and the court's first writes to its counters. Meeting it needs a
-cheaper snapshot, a lower `MAX_ARBITRATORS` or a revised target, all outside S3; the item is open for review.
+With the S2 layout, the first all-warming `openDispute` measured 2,170,188 and missed its target: the snapshot alone
+cost 1,911,409, mostly zero-to-nonzero writes of the `stake` slot of each account whose stake had only warmed. The S3
+corrective pass stores `principal = stake + warming` in that slot instead (below), which brings the snapshot to
+1,343,187 without changing any rule. With `forge test --isolate`, where each call is its own transaction and earlier
+writes in the test are not priced as dirty, the numbers are higher. They are still within every target: first opens
+1,485,032 / 1,458,616, `drawPanel` 637,215, `NoPanel` resolve 424,944, panel resolve 230,293 / 200,090.
 
-Selection is implemented in `PanelSelection.selectIndexes(seed, n)`, which reverts with `TooFewCandidates` for
-`n < 3`; the registry takes the seed from the court and never fetches block data.
+**Account storage after the S3 corrective pass.** The three slots hold `principal` with `reserved`, `warming` with
+`locked`, and `warmingUntil` with `listed`. Matured stake is `principal - warming`, and maturation clears `warming`
+only. `accountOf`, `freeStake`, maturation timing, top-up behavior, collateral checks, delisting thresholds, snapshot
+contents, events and errors are unchanged. `MAX_PRINCIPAL` now bounds the stored `principal` directly.
 
 ### 7.6 Predictability, manipulation and trust
 

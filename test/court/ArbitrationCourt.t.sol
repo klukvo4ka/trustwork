@@ -59,8 +59,14 @@ contract ArbitrationCourtTest is CourtTestBase {
         new ArbitrationCourt(token, 0, SEAT_LOCK, penaltyRecipient);
         vm.expectRevert(ArbitrationCourt.ZeroSeatLock.selector);
         new ArbitrationCourt(token, DISPUTE_FEE, 0, penaltyRecipient);
-        vm.expectRevert(abi.encodeWithSelector(ArbitrationCourt.PenaltyRecipientIsFactory.selector, address(this)));
-        new ArbitrationCourt(token, DISPUTE_FEE, SEAT_LOCK, address(this));
+    }
+
+    function test_Constructor_AcceptsDeployingFactoryAsPenaltyRecipient() public {
+        ArbitrationCourt factoryRecipientCourt = new ArbitrationCourt(token, DISPUTE_FEE, SEAT_LOCK, address(this));
+        assertEq(factoryRecipientCourt.factory(), address(this));
+        assertEq(factoryRecipientCourt.penaltyRecipient(), address(this));
+        assertEq(factoryRecipientCourt.registry().penaltyRecipient(), address(this));
+        assertEq(factoryRecipientCourt.registry().court(), address(factoryRecipientCourt));
     }
 
     function test_RevertWhen_RegistryRestrictionsViolated() public {
@@ -559,6 +565,52 @@ contract ArbitrationCourtTest is CourtTestBase {
         court.revealVote(disputeId, CLIENT_VOTE, salt);
     }
 
+    function test_RevertWhen_CommitmentBoundToAnotherCourtIsRevealed() public {
+        MockArbitrationFactory otherFactory =
+            new MockArbitrationFactory(token, DISPUTE_FEE, SEAT_LOCK, penaltyRecipient);
+        address otherCourt = address(otherFactory.court());
+        _activeArbitrators(3, SEAT_LOCK);
+        uint256 disputeId = _open();
+        address[3] memory panel = _draw(disputeId);
+        address arbitrator = panel[0];
+        bytes32 salt = _salt(arbitrator, disputeId);
+        bytes32 foreign = _expectedCommitment(block.chainid, otherCourt, disputeId, arbitrator, CLIENT_VOTE, salt);
+        vm.prank(arbitrator);
+        court.commitVote(disputeId, foreign);
+        _toRevealPhase(disputeId);
+
+        vm.expectRevert(abi.encodeWithSelector(ArbitrationCourt.InvalidReveal.selector, disputeId, arbitrator));
+        vm.prank(arbitrator);
+        court.revealVote(disputeId, CLIENT_VOTE, salt);
+
+        IArbitrationCourt.Seat memory seat = court.getSeats(disputeId)[0];
+        assertEq(seat.commitment, foreign);
+        assertEq(uint256(seat.vote), uint256(IArbitrationCourt.Vote.None));
+    }
+
+    function test_RevertWhen_CommitmentBoundToAnotherDisputeIsRevealed() public {
+        _activeArbitrators(3, 2 * SEAT_LOCK);
+        uint256 disputeId = _open();
+        uint256 otherId =
+            _openFor(factory.createOrder(makeAddr("otherClient"), freelancer, feeRecipient), makeAddr("otherClient"));
+        address[3] memory panel = _draw(disputeId);
+        address arbitrator = panel[0];
+        bytes32 salt = _salt(arbitrator, disputeId);
+        bytes32 foreign = _expectedCommitment(block.chainid, address(court), otherId, arbitrator, CLIENT_VOTE, salt);
+        vm.prank(arbitrator);
+        court.commitVote(disputeId, foreign);
+        _toRevealPhase(disputeId);
+
+        vm.expectRevert(abi.encodeWithSelector(ArbitrationCourt.InvalidReveal.selector, disputeId, arbitrator));
+        vm.prank(arbitrator);
+        court.revealVote(disputeId, CLIENT_VOTE, salt);
+
+        IArbitrationCourt.Seat memory seat = court.getSeats(disputeId)[0];
+        assertEq(seat.commitment, foreign);
+        assertEq(uint256(seat.vote), uint256(IArbitrationCourt.Vote.None));
+        assertEq(uint256(_status(otherId)), uint256(IArbitrationCourt.DisputeStatus.AwaitingSeed));
+    }
+
     function test_RevealVote_RejectsRawValuesOutsideVoteRange() public {
         _activeArbitrators(3, SEAT_LOCK);
         uint256 disputeId = _open();
@@ -947,6 +999,46 @@ contract ArbitrationCourtTest is CourtTestBase {
         assertEq(uint256(reason), uint256(IArbitrationCourt.RulingReason.NoPanel));
         assertEq(uint256(_status(disputeId)), uint256(IArbitrationCourt.DisputeStatus.Resolved));
         assertEq(court.claimable(payer), DISPUTE_FEE);
+    }
+
+    function test_Reentrancy_DrawPanelFromFeePullCallbackIsBlocked() public {
+        ReentrantToken reentrant = new ReentrantToken();
+        MockArbitrationFactory reentrantFactory =
+            new MockArbitrationFactory(reentrant, DISPUTE_FEE, SEAT_LOCK, penaltyRecipient);
+        ArbitrationCourt reentrantCourt = reentrantFactory.court();
+        ArbitratorRegistry reentrantRegistry = ArbitratorRegistry(address(reentrantCourt.registry()));
+        for (uint256 i; i < 3; ++i) {
+            address arbitrator = _arbitrator(i);
+            reentrant.mint(arbitrator, 2 * SEAT_LOCK);
+            vm.startPrank(arbitrator);
+            reentrant.approve(address(reentrantRegistry), 2 * SEAT_LOCK);
+            reentrantRegistry.deposit(2 * SEAT_LOCK);
+            vm.stopPrank();
+        }
+        vm.warp(block.timestamp + ACTIVATION_DELAY);
+        reentrant.mint(client, 2 * DISPUTE_FEE);
+        vm.prank(client);
+        reentrant.approve(address(reentrantCourt), 2 * DISPUTE_FEE);
+        uint256 disputeId = reentrantFactory.createOrder(client, freelancer, feeRecipient).openDispute(0);
+        IArbitrationCourt.Dispute memory armed = reentrantCourt.getDispute(disputeId);
+        vm.roll(armed.selectionBlock + 1);
+        vm.setBlockhash(armed.selectionBlock, keccak256("block"));
+
+        reentrant.arm(address(reentrantCourt), abi.encodeCall(ArbitrationCourt.drawPanel, (disputeId)));
+        reentrantFactory.createOrder(client, freelancer, feeRecipient).openDispute(0);
+        _assertBlocked(reentrant);
+
+        IArbitrationCourt.Dispute memory dispute = reentrantCourt.getDispute(disputeId);
+        assertEq(uint256(dispute.status), uint256(IArbitrationCourt.DisputeStatus.AwaitingSeed));
+        assertEq(dispute.selectionBlock, armed.selectionBlock);
+        assertEq(dispute.commitDeadline, 0);
+        assertEq(reentrantCourt.getSeats(disputeId)[0].arbitrator, address(0));
+        assertEq(
+            uint256(reentrantRegistry.snapshotState(disputeId)), uint256(IArbitratorRegistry.SnapshotState.Reserved)
+        );
+
+        reentrantCourt.drawPanel(disputeId);
+        assertEq(uint256(reentrantCourt.getDispute(disputeId).status), uint256(IArbitrationCourt.DisputeStatus.Voting));
     }
 
     function _assertBlocked(ReentrantToken reentrant) private view {

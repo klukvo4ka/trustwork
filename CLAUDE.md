@@ -49,8 +49,9 @@ test-only `RegistryCourtHarness`.
 Stage 3D (current): slice S3 — `ArbitrationCourt`, `IArbitrationCourt`, the minimal read interfaces `IOrderFactory`
 and `IOrderParties`, and the test-only `MockArbitrationFactory` and `MockDisputableOrder`.
 
-- Immutable `factory = msg.sender`; the court deploys its own immutable `ArbitratorRegistry`; `penaltyRecipient` may
-  not be the factory. No owner, pause, setters, upgrades or rescue functions.
+- Immutable `factory = msg.sender`; the court deploys its own immutable `ArbitratorRegistry`; `penaltyRecipient` is
+  restricted only by the registry (not the court or the registry). No owner, pause, setters, upgrades or rescue
+  functions.
 - `openDispute` only from orders the factory recognizes; pulls exactly `disputeFee` from the order's client; snapshots
   candidates excluding client, freelancer and fee recipient; `AwaitingCandidates` below three candidates, otherwise
   `AwaitingSeed` with `selectionBlock = block.number + 10`. `retrySnapshot` only before `panelDeadline`.
@@ -61,7 +62,9 @@ and `IOrderParties`, and the test-only `MockArbitrationFactory` and `MockDisputa
   `penaltyRecipient`; all payouts are credits claimed through `claimReward`.
 - `feesReceived + penaltiesReceived == claimsPaid + pendingFees + totalClaimable`,
   `pendingFees == disputeFee * unresolved`, `penaltiesReceived == registry.penaltiesSent`.
-- `WorkOrder` and `TrustWorkFactory` are unchanged and do not use the court; the registry is unchanged.
+- The registry's API and rules are unchanged; the corrective pass changed only its private storage to keep
+  `principal = stake + warming` (matured stake derived as `principal - warming`) to meet the gas targets.
+- `WorkOrder` and `TrustWorkFactory` are unchanged and do not use the court.
 
 Out of scope until a later stage explicitly asks for it: order or factory integration with the court (slice S4) and
 their constructor arguments, `applyRuling` and order-side dispute state; cancellation by agreement and other refunds;

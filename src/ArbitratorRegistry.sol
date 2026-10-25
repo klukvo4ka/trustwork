@@ -19,8 +19,7 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
     uint256 public constant ACTIVATION_DELAY = 2 days;
     uint256 public constant MAX_ARBITRATORS = 32;
     uint256 public constant PANEL_SIZE = PanelSelection.PANEL_SIZE;
-    /// @notice Upper bound on one account's `stake + warming`, so that maturing warming into `stake` cannot overflow
-    /// the packed `uint128` fields.
+    /// @notice Upper bound on one account's `stake + warming`, which is stored as one packed `uint128` principal.
     uint256 public constant MAX_PRINCIPAL = type(uint128).max;
 
     IERC20 public immutable stakeToken;
@@ -34,10 +33,10 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
     uint256 public withdrawalsPaid;
     uint256 public penaltiesSent;
 
-    /// @dev Packed so that a reservation and the maturation it triggers usually rewrite slots that are already
-    /// nonzero: `stake` with `reserved`, `warming` with `locked`, and `warmingUntil` with `listed`.
+    /// @dev `principal` is `stake + warming`, so matured stake is `principal - warming` and maturation only clears
+    /// `warming`. Every listed account has nonzero `principal`, so a reservation rewrites a nonzero slot.
     struct Ledger {
-        uint128 stake;
+        uint128 principal;
         uint128 reserved;
         uint128 warming;
         uint128 locked;
@@ -96,7 +95,7 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
 
         Ledger storage account = _accounts[msg.sender];
         _mature(account);
-        uint256 principal = uint256(account.stake) + account.warming;
+        uint256 principal = account.principal;
         uint256 capacity = MAX_PRINCIPAL - principal;
         if (amount > capacity) revert PrincipalLimitExceeded(amount, capacity);
         bool listing = !account.listed;
@@ -106,6 +105,7 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
         }
 
         uint64 warmingUntil = SafeCast.toUint64(block.timestamp + ACTIVATION_DELAY);
+        account.principal += SafeCast.toUint128(amount);
         account.warming += SafeCast.toUint128(amount);
         account.warmingUntil = warmingUntil;
         totalStaked += amount;
@@ -125,10 +125,10 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         Ledger storage account = _accounts[msg.sender];
         _mature(account);
-        uint256 available = account.stake - account.locked - account.reserved;
+        uint256 available = _stake(account) - account.locked - account.reserved;
         if (amount > available) revert InsufficientFreeStake(amount, available);
 
-        account.stake -= SafeCast.toUint128(amount);
+        account.principal -= SafeCast.toUint128(amount);
         totalStaked -= amount;
         withdrawalsPaid += amount;
         _delistIfBelowMinimum(msg.sender, account);
@@ -235,7 +235,7 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
         Ledger storage account = _accounts[arbitrator];
         candidate.state = CandidateState.Released;
         account.locked -= _seatLock;
-        account.stake -= SafeCast.toUint128(penalty);
+        account.principal -= SafeCast.toUint128(penalty);
         totalStaked -= penalty;
         penaltiesSent += penalty;
         _delistIfBelowMinimum(arbitrator, account);
@@ -255,7 +255,7 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
     function accountOf(address arbitrator) external view returns (Account memory) {
         Ledger storage account = _accounts[arbitrator];
         return Account({
-            stake: account.stake,
+            stake: _stake(account),
             warming: account.warming,
             locked: account.locked,
             reserved: account.reserved,
@@ -282,16 +282,17 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
         if (current != expected) revert InvalidSnapshotState(disputeId, current);
     }
 
+    function _stake(Ledger storage account) private view returns (uint256) {
+        return account.principal - account.warming;
+    }
+
     function _free(Ledger storage account) private view returns (uint256) {
-        uint256 matured = account.warmingUntil <= block.timestamp ? account.warming : 0;
-        return uint256(account.stake) + matured - account.locked - account.reserved;
+        uint256 unmatured = account.warmingUntil <= block.timestamp ? 0 : account.warming;
+        return account.principal - unmatured - account.locked - account.reserved;
     }
 
     function _mature(Ledger storage account) private {
-        if (account.warming != 0 && account.warmingUntil <= block.timestamp) {
-            account.stake += account.warming;
-            account.warming = 0;
-        }
+        if (account.warming != 0 && account.warmingUntil <= block.timestamp) account.warming = 0;
     }
 
     function _list(address arbitrator, Ledger storage account) private {
@@ -302,7 +303,7 @@ contract ArbitratorRegistry is IArbitratorRegistry, ReentrancyGuard {
     }
 
     function _delistIfBelowMinimum(address arbitrator, Ledger storage account) private {
-        if (!account.listed || uint256(account.stake) + account.warming >= seatLock) return;
+        if (!account.listed || account.principal >= seatLock) return;
         uint256 position = _listPosition[arbitrator];
         address last = _listed[_listed.length - 1];
         _listed[position] = last;

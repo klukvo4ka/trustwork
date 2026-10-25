@@ -49,7 +49,6 @@ contract ArbitrationCourt is IArbitrationCourt, ReentrancyGuard {
     error TokenHasNoCode(address token);
     error ZeroDisputeFee();
     error ZeroSeatLock();
-    error PenaltyRecipientIsFactory(address penaltyRecipient);
     error UnknownOrder(address caller);
     error UnknownDispute(uint256 disputeId);
     error InvalidDisputeStatus(uint256 disputeId, DisputeStatus status);
@@ -76,7 +75,6 @@ contract ArbitrationCourt is IArbitrationCourt, ReentrancyGuard {
         if (address(stakeToken_).code.length == 0) revert TokenHasNoCode(address(stakeToken_));
         if (disputeFee_ == 0) revert ZeroDisputeFee();
         if (seatLock_ == 0) revert ZeroSeatLock();
-        if (penaltyRecipient_ == msg.sender) revert PenaltyRecipientIsFactory(penaltyRecipient_);
 
         factory = msg.sender;
         stakeToken = stakeToken_;

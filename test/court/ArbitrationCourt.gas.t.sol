@@ -44,9 +44,7 @@ abstract contract CourtGasBase is CourtTestBase {
         return vm.lastCallGas().gasTotalUsed;
     }
 
-    /// @dev `enforceOpenTarget` is false only for the all-warming fixture, whose `openDispute` exceeds the 2,000,000
-    /// target (open acceptance item, see README): the unchanged registry snapshot alone costs about 1.91M there.
-    function _measureOpenDrawAndResolve(string memory fixture, bool enforceOpenTarget) internal {
+    function _measureOpenDrawAndResolve(string memory fixture) internal {
         (uint256 disputeId, uint256 openGas) = _measuredOpen(order, client);
         assertEq(registry.candidatesOf(disputeId).length, 32);
         for (uint256 i; i < 32; ++i) {
@@ -76,7 +74,7 @@ abstract contract CourtGasBase is CourtTestBase {
 
         MockDisputableOrder third = factory.createOrder(makeAddr("thirdClient"), freelancer, feeRecipient);
         (uint256 undrawnId,) = _measuredOpen(third, makeAddr("thirdClient"));
-        assertGe(registry.candidatesOf(undrawnId).length, 29);
+        assertEq(registry.candidatesOf(undrawnId).length, 32);
         vm.warp(court.getDispute(undrawnId).panelDeadline);
         uint256 noPanelGas = _measuredCourtCall(abi.encodeCall(court.resolve, (undrawnId)));
 
@@ -85,13 +83,8 @@ abstract contract CourtGasBase is CourtTestBase {
         console.log("  drawPanel, 32 candidates:", drawGas);
         console.log("  resolve, panel with 3 faulty seats:", faultyResolveGas);
         console.log("  resolve, panel with 3 valid reveals:", revealedResolveGas);
-        console.log("  resolve NoPanel from AwaitingSeed, candidates:", registry.candidatesOf(undrawnId).length);
-        console.log("    gas:", noPanelGas);
-        if (enforceOpenTarget) {
-            assertLe(openGas, OPEN_TARGET);
-        } else if (openGas > OPEN_TARGET) {
-            console.log("  MISSED openDispute target by:", openGas - OPEN_TARGET);
-        }
+        console.log("  resolve NoPanel from AwaitingSeed, 32 candidates:", noPanelGas);
+        assertLe(openGas, OPEN_TARGET);
         assertLe(drawGas, DRAW_TARGET);
         assertLe(faultyResolveGas, PANEL_RESOLVE_TARGET);
         assertLe(revealedResolveGas, PANEL_RESOLVE_TARGET);
@@ -114,7 +107,7 @@ contract ArbitrationCourtMixedGasTest is CourtGasBase {
     }
 
     function test_Gas_CourtEntryPoints() public {
-        _measureOpenDrawAndResolve("mixed fixture (16 materialized, 16 matured warming)", true);
+        _measureOpenDrawAndResolve("mixed fixture (16 materialized, 16 matured warming)");
     }
 }
 
@@ -129,7 +122,7 @@ contract ArbitrationCourtAllWarmingGasTest is CourtGasBase {
     }
 
     function test_Gas_CourtEntryPoints() public {
-        _measureOpenDrawAndResolve("all-warming fixture (32 matured warming)", false);
+        _measureOpenDrawAndResolve("all-warming fixture (32 matured warming)");
     }
 }
 
@@ -194,6 +187,6 @@ contract ArbitrationCourtSteadyStateGasTest is CourtGasBase {
 
         assertEq(registry.candidatesOf(disputeId).length, 32);
         console.log("openDispute, all-warming fixture after an earlier dispute:", openGas);
-        if (openGas > OPEN_TARGET) console.log("  MISSED openDispute target by:", openGas - OPEN_TARGET);
+        assertLe(openGas, OPEN_TARGET);
     }
 }

@@ -25,6 +25,7 @@ abstract contract RegistryGasBase is RegistryTestBase {
         assertEq(uint256(registry.snapshotState(1)), uint256(IArbitratorRegistry.SnapshotState.Selected));
 
         _reserve(2);
+        assertEq(registry.candidatesOf(2).length, 32);
         uint256 releaseGas = _coldCall(abi.encodeCall(court.releaseReservations, (2)));
         assertEq(uint256(registry.snapshotState(2)), uint256(IArbitratorRegistry.SnapshotState.Released));
 
@@ -47,12 +48,12 @@ abstract contract RegistryGasBase is RegistryTestBase {
 }
 
 /// @dev Half of the accounts hold matured warming stake the snapshot must materialize; half were already materialized
-/// by an earlier withdrawal.
+/// by an earlier withdrawal. Every account ends with `2 * SEAT_LOCK`, so both snapshots hold 32 candidates.
 contract ArbitratorRegistryGasTest is RegistryGasBase {
     function setUp() public override {
         super.setUp();
         for (uint256 i; i < 32; ++i) {
-            _deposit(_arbitrator(i), 2 * SEAT_LOCK);
+            _deposit(_arbitrator(i), i < 16 ? 2 * SEAT_LOCK + 1 : 2 * SEAT_LOCK);
         }
         vm.warp(block.timestamp + ACTIVATION_DELAY);
         for (uint256 i; i < 16; ++i) {

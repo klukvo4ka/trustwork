@@ -355,15 +355,44 @@ call into the court harness, including its forwarding call and excluding the 21,
 
 | Operation | Mixed fixture (16 matured warming, 16 materialized) | All-warming fixture (32 matured warming) | Target |
 | --- | --- | --- | --- |
-| `reserveCandidates` | 1,580,835 | 1,915,251 | ≤ 2,000,000 |
+| `reserveCandidates` | 1,292,803 (was 1,580,835) | 1,343,187 (was 1,915,251) | ≤ 2,000,000 |
 | `selectPanel` | 245,173 | 205,373 | ≤ 800,000 |
-| `releaseReservations` | 170,399 | 180,943 | ≤ 800,000 |
+| `releaseReservations` | 180,943 | 180,943 | ≤ 800,000 |
 
-An unpacked layout measured 2,284,500 for the mixed snapshot. Account fields are therefore packed into three storage
-slots: `stake` with `reserved`, `warming` with `locked`, and `warmingUntil` with `listed`, all amounts as `uint128`.
-Packing is not free of behavioral consequences. It introduces the per-account principal limit above, and `seatLock`
-must fit in `uint128`. The public `accountOf` view still returns `uint256` amounts. The all-warming snapshot leaves
-about 4% headroom under its target.
+The mixed `releaseReservations` figure was previously reported as 170,399 for what was actually a 30-candidate
+second snapshot (two materialized accounts lacked free stake for it). The fixture now funds those accounts with one
+extra unit so that both snapshots hold exactly 32 candidates, and the test asserts it.
+
+**Storage.** Each account is packed into three slots, all amounts `uint128`: `principal` with `reserved`, `warming`
+with `locked`, and `warmingUntil` with `listed`. `principal` is `stake + warming`; matured stake is derived as
+`principal - warming`, and maturation only clears `warming`. An earlier layout stored `stake` instead of
+`principal`, so the first reservation of an account whose stake had only ever warmed wrote its `stake` slot from zero
+(about 20,000 gas each, 32 times in the all-warming snapshot). With `principal` that slot is nonzero from the first
+deposit, and a reservation rewrites it at the nonzero-to-nonzero price. The first deposit now pays that zero-to-nonzero
+write instead. Observable behavior is unchanged:
+
+- `accountOf` reports the same buckets (`stake = principal - warming`), and warming still folds into stake only on a
+  state-changing touch;
+- `freeStake` still counts warming only after its activation time, and a top-up still restarts only the delay of
+  stake that has not matured yet;
+- withdrawals and penalties can only draw on matured stake, because `locked + reserved <= stake` is checked against
+  the derived stake;
+- delisting compares `principal`, which equals the former `stake + warming`.
+
+Packing has consequences that are part of the API: `seatLock` must fit in `uint128`, and the per-account principal
+limit above bounds `principal` itself, so it cannot overflow. The public `accountOf` view still returns `uint256`
+amounts.
+
+Each measured call runs inside one Foundry test transaction together with the calls before it, so EIP-2200 prices
+a write to a slot already changed earlier in the test as a cheap "dirty" write. `vm.cool` resets warmth, not these
+original values. Running the same fixtures with `forge test --isolate`, where every top-level call is its own
+transaction, gives the higher, more realistic figures in the isolated columns. Every target holds in both modes.
+
+| Operation (isolated) | Mixed fixture | All-warming fixture | Target |
+| --- | --- | --- | --- |
+| `reserveCandidates` | 1,235,487 (was 1,523,519) | 1,209,071 (was 1,781,135) | ≤ 2,000,000 |
+| `selectPanel` | 468,489 | 468,489 | ≤ 800,000 |
+| `releaseReservations` | 383,847 | 383,847 | ≤ 800,000 |
 
 ## Arbitration court
 
@@ -373,10 +402,9 @@ the factory and the orders are test mocks (`MockArbitrationFactory`, `MockDisput
 `TrustWorkFactory` and `WorkOrder` do not call the court yet.
 
 **Construction.** `stakeToken` (nonzero, has code), `disputeFee` and `seatLock` (positive) and `penaltyRecipient`
-(nonzero). The registry's own checks apply unchanged, so `penaltyRecipient` cannot be the court or the registry and
-`seatLock` must fit `uint128`. The court additionally rejects `penaltyRecipient == factory`
-(`PenaltyRecipientIsFactory`): the factory is the other protocol contract, and the design keeps protocol contracts
-from being the beneficiary of penalties. There is no owner, setter, pause, upgrade or rescue function.
+(nonzero). The registry's own checks apply unchanged: `penaltyRecipient` cannot be the court or the registry, and
+`seatLock` must fit `uint128`. Any other address is accepted, including the deploying factory and other contracts.
+There is no owner, setter, pause, upgrade or rescue function.
 
 **Opening.** `openDispute(milestoneIndex)` is accepted only from an address for which `factory.isWorkOrder` returns
 true. The court reads `client`, `freelancer` and `feeRecipient` from that order, assigns the next id (ids start at
@@ -430,27 +458,39 @@ intrinsic cost and calldata; optimized build, `optimizer_runs = 200`):
 
 | Operation | Mixed fixture (16 materialized, 16 matured warming) | All-warming fixture (32 matured warming) | Target |
 | --- | --- | --- | --- |
-| `openDispute` (first dispute) | 1,835,772 | **2,170,188 — missed** | ≤ 2,000,000 |
-| `openDispute` (after an earlier dispute) | — | 1,993,488 | ≤ 2,000,000 |
-| successful `retrySnapshot` | 1,526,825 | 1,861,241 | ≤ 2,000,000 |
+| `openDispute` (first dispute) | 1,547,740 | 1,598,124 | ≤ 2,000,000 |
+| `openDispute` (after an earlier dispute) | — | 1,331,824 | ≤ 2,000,000 |
+| successful `retrySnapshot` | 1,193,993 | 1,199,577 | ≤ 2,000,000 |
 | `drawPanel` | 394,511 | 374,611 | ≤ 800,000 |
-| `resolve`, panel, 3 faulty seats | 204,259 | 201,459 | ≤ 400,000 |
-| `resolve`, panel, 3 valid reveals | 176,856 | 176,856 | ≤ 400,000 |
+| `resolve`, panel, 3 faulty seats | 209,289 | 209,289 | ≤ 400,000 |
+| `resolve`, panel, 3 valid reveals | 176,286 | 176,286 | ≤ 400,000 |
 | `resolve`, `NoPanel` from `AwaitingSeed` | 221,240 | 221,240 | ≤ 800,000 |
 
-**Open item: all-warming `openDispute`.** The first dispute in the all-warming fixture exceeds its target by 170,188
-gas. Of the 2,170,188, the unchanged registry snapshot (`reserveCandidates`, which must mature all 32 accounts) costs
-1,911,409; the fee `transferFrom` about 28,000 and the order, factory and balance reads about 6,500; the remaining
-about 220,000 is the court's own work, dominated by first-dispute storage (the dispute record and zero-to-nonzero
-writes of its counters). The same open after an earlier dispute, with the counters and the court's token balance
-already nonzero, measures 1,993,488. The registry leaves about 85,000 gas for the court in this fixture, which is less than the court's minimum
-work, so meeting the target requires a change outside this slice: a cheaper registry snapshot, a lower
-`MAX_ARBITRATORS`, or a revised target. The gas test enforces the target in the mixed fixture and, in the all-warming
-fixture, logs the overrun instead of failing so that the rest of the suite stays meaningful; it can be made a failing
-assertion if preferred. All other targets are met in both fixtures.
+Every row is an unconditional assertion, and every fixture asserts exactly 32 candidates. Before the registry
+storage change, the first all-warming `openDispute` measured 2,170,188 and failed its target; the other rows were
+1,835,772 (mixed open), 1,993,488 (steady-state open), 1,526,825 / 1,861,241 (retry), 204,259 / 201,459 (faulty
+resolve) and 176,856 (revealed resolve). The savings come entirely from the registry snapshot (see Storage under
+Arbitrator registry); the court is unchanged apart from its constructor. The faulty-seat resolve now looks 5,030–
+7,830 gas higher only because the old `stake` slot had been written earlier in the same test transaction and
+was priced as dirty. In isolated runs it is lower than before.
 
-**Sizes** (optimized build): `ArbitrationCourt` 10,616 B runtime and 20,784 B initcode (the initcode embeds the
-registry's creation code), `ArbitratorRegistry` 8,653 B / 9,350 B.
+Each measured call runs inside one Foundry test transaction together with the calls before it, so EIP-2200 prices
+a write to a slot already changed earlier in the test as a cheap "dirty" write. `vm.cool` resets warmth, not these
+original values. Running the same fixtures with `forge test --isolate`, where every top-level call is its own
+transaction, gives the higher, more realistic figures in the isolated columns. Every target holds in both modes.
+
+| Operation (isolated) | Mixed fixture | All-warming fixture | Target |
+| --- | --- | --- | --- |
+| `openDispute` (first dispute) | 1,485,032 (was 1,773,064) | 1,458,616 (was 2,030,680) | ≤ 2,000,000 |
+| `openDispute` (after an earlier dispute) | — | 1,390,216 (was 1,962,280) | ≤ 2,000,000 |
+| successful `retrySnapshot` | 1,272,497 (was 1,560,529) | 1,246,081 (was 1,818,145) | ≤ 2,000,000 |
+| `drawPanel` | 637,215 | 637,215 | ≤ 800,000 |
+| `resolve`, panel, 3 faulty seats | 230,293 (was 230,863) | 230,293 (was 230,863) | ≤ 400,000 |
+| `resolve`, panel, 3 valid reveals | 200,090 (was 200,660) | 200,090 (was 200,660) | ≤ 400,000 |
+| `resolve`, `NoPanel` from `AwaitingSeed` | 424,944 | 424,944 | ≤ 800,000 |
+
+**Sizes** (optimized build): `ArbitrationCourt` 10,616 B runtime and 20,745 B initcode (the initcode embeds the
+registry's creation code), `ArbitratorRegistry` 8,667 B / 9,364 B.
 
 ## Development
 
@@ -512,7 +552,6 @@ Stage 3B caveats:
 
 Stage 3D caveats:
 
-- The all-warming `openDispute` gas target is missed (see Arbitration court above).
 - The court trusts its factory's `isWorkOrder` and the order's party getters; with the test mocks any caller can make
   an order open a dispute. Who may open a dispute, and when, is enforced by the order in slice S4.
 - A ruling is recorded in the court only; nothing moves escrowed order funds yet.
