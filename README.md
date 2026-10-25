@@ -2,16 +2,17 @@
 
 Milestone-based escrow for freelance work, written in Solidity with Foundry and OpenZeppelin Contracts v5.
 
-> **Status:** Stage 3C (arbitrator registry) of a portfolio project. Unaudited and intended for local development and testnets only.
+> **Status:** Stage 3E (orders integrated with the arbitration court) of a portfolio project. Unaudited and intended for local development and testnets only.
 > Do not use it with real funds.
 
 ## Architecture
 
 | Contract           | Role                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------- |
-| `TrustWorkFactory` | Deploys an independent `WorkOrder` per engagement. The caller becomes the client.     |
-| `WorkOrder`        | Holds one engagement's budget and releases it milestone by milestone.                  |
-| `ArbitratorRegistry` | Stake ledger and per-dispute candidate snapshots for the planned arbitration court. Not yet connected to orders. |
+| `TrustWorkFactory` | Deploys the arbitration court once, then an independent `WorkOrder` per engagement bound to that court. The caller becomes the client. |
+| `WorkOrder`        | Holds one engagement's budget and releases it milestone by milestone; a disputed milestone ends the order with the court's ruling. |
+| `ArbitrationCourt` | Disputes opened by the factory's orders: candidate snapshot, panel draw, commit-reveal voting, rulings, fee and penalty credits. |
+| `ArbitratorRegistry` | Stake ledger and per-dispute candidate snapshots, deployed by and used only by the court. |
 
 Each order is its own contract, so funds and state of different engagements never mix. There is no owner, admin,
 upgrade path, or pause switch. Escrowed tokens leave an order only through settlement (to the fee recipient and the
@@ -20,15 +21,16 @@ freelancer) or through `claimPayout` of a credit recorded at termination.
 Order terms (client, freelancer, token, fee recipient, fee, review period, delivery period, total) are immutables. Milestone amounts
 live in a storage array because Solidity has no immutable arrays; nothing writes to an amount after construction.
 
-The factory forwards all terms to the `WorkOrder` constructor, which performs the validation. A `WorkOrder` deployed
-directly therefore enforces the same rules, and the factory's `WorkOrderCreated` event is the source of truth for
-orders created through TrustWork.
+The factory forwards all terms and its court to the `WorkOrder` constructor, which performs the validation. A
+`WorkOrder` deployed directly therefore enforces the same rules, but the court only accepts disputes from orders the
+factory created (`isWorkOrder`), so a directly deployed order can never open a dispute. The factory's
+`WorkOrderCreated` event is the source of truth for orders created through TrustWork.
 
 ### Validation at creation
 
 | Rule                                                      | Error                    |
 | --------------------------------------------------------- | ------------------------ |
-| Client, freelancer, token and fee recipient are nonzero   | `ZeroAddress`            |
+| Client, freelancer, token, fee recipient and court are nonzero | `ZeroAddress`       |
 | Client and freelancer differ                              | `ClientIsFreelancer`     |
 | Token address has deployed code                           | `TokenHasNoCode`         |
 | At least one milestone                                    | `NoMilestones`           |
@@ -37,6 +39,7 @@ orders created through TrustWork.
 | `0 < reviewPeriod <= 30 days`                             | `InvalidReviewPeriod`    |
 | `0 < deliveryPeriod <= 180 days`                          | `InvalidDeliveryPeriod`  |
 | Fee recipient is not the order itself                     | `FeeRecipientIsOrder`    |
+| `penaltyRecipient` is not the client, freelancer or fee recipient (factory) | `PenaltyRecipientIsParty` |
 
 A milestone list whose sum overflows `uint256` reverts with a checked-arithmetic panic.
 
@@ -49,9 +52,13 @@ the accounting records it as paid.
 ```
 Unfunded --fund()--> Active --(last milestone settled)--> Completed
                        |
-                       +--reclaimAfterDeliveryExpiry()--> Terminated --claimPayout()--> (credits paid)
+                       +--reclaimAfterDeliveryExpiry()--------------------> Terminated --claimPayout()--> (credits paid)
+                       |                                                       ^
+                       +--openDispute()--> Disputed --applyRuling()-----------+
 
 Milestone: Pending --submitMilestone()--> Submitted --approveMilestone() | finalizeMilestone()--> Settled
+                                              |
+                                              +--openDispute()--> Disputed
 ```
 
 1. **Fund** — only the client, once, for exactly `totalAmount`, through `fund()` (prior ERC-20 approval) or
@@ -68,6 +75,8 @@ Milestone: Pending --submitMilestone()--> Submitted --approveMilestone() | final
    and pays out. Settling the last milestone sets the order to `Completed` instead.
 6. **Reclaim** — only the client, when the current milestone is still `Pending` and
    `block.timestamp >= deliveryDeadline` (see [Delivery expiry](#delivery-expiry-and-claims)).
+7. **Dispute** — only the client, for the current `Submitted` milestone, while `block.timestamp < reviewDeadline`;
+   the court's ruling then ends the order (see [Disputes](#disputes)).
 
 Every function that targets a milestone takes its index and requires it to equal `currentMilestone`. Milestones are
 strictly sequential, and a stale or duplicated transaction cannot act on a different milestone than intended.
@@ -105,6 +114,60 @@ and later milestones are not touched; the terminal status voids them.
 blocks the recipient), the whole call reverts and the credit stays for a later retry. Reclaim itself succeeds even
 while the client is blocked, because it transfers nothing. A zero credit reverts with `NothingToClaim`. The order
 stays `Terminated` after all credits are paid.
+
+## Disputes
+
+**Wiring.** `TrustWorkFactory(stakeToken, disputeFee, seatLock, penaltyRecipient)` deploys its immutable
+`ArbitrationCourt`, which deploys its immutable `ArbitratorRegistry`. The court's and registry's constructor checks
+(nonzero token with code, positive fee and seat lock, nonzero `penaltyRecipient` that is neither the court nor the
+registry) bubble up from the factory. Every order the factory creates receives the immutable `court` and is recorded
+in `isWorkOrder`; nothing else is ever recognized, including earlier orders and directly deployed `WorkOrder`
+contracts. The factory rejects `penaltyRecipient` as the caller (client), freelancer or fee recipient with
+`PenaltyRecipientIsParty`, and adds no other address restriction. There is no owner, setter, upgrade, pause or rescue
+function in any of the three contracts.
+
+**Opening.** `openDispute(index)` requires the client, an `Active` order, `index == currentMilestone`, a
+`Submitted` milestone and `block.timestamp < reviewDeadline`. It sets the order and the milestone to `Disputed`,
+consumes one `approvalNonce`, then calls `court.openDispute(index)`, stores the returned `disputeId` and emits
+`DisputeOpened(index, disputeId, consumedNonce)`. The court pulls `disputeFee` of its stake token directly from the
+client, so the client approves that amount to the **court**, separately from the escrow funding approved to the
+order. A failed fee pull or court call reverts the whole transaction: order status, milestone, nonce, `disputeId`,
+balances, reservations and court counters stay as they were.
+
+| Instant | `openDispute` | `finalizeMilestone` | `approveMilestone` |
+| --- | --- | --- | --- |
+| `reviewDeadline - 1` | allowed | reverts `ReviewPeriodNotElapsed` | allowed |
+| `reviewDeadline` and later | reverts `ReviewPeriodElapsed` | allowed | allowed |
+
+When an approval and a dispute land in the same block, the first transaction wins and the second reverts on its
+state precondition (`NotCurrentMilestone` after settlement, `InvalidOrderStatus(Disputed)` after the dispute).
+
+**While disputed.** `fund`, `fundWithPermit`, `submitMilestone`, `approveMilestone`, `approveMilestoneBySignature`,
+`finalizeMilestone`, `reclaimAfterDeliveryExpiry`, `openDispute` and `claimPayout` revert with
+`InvalidOrderStatus(Disputed)`. A dispute is final for the order: there is no resubmission, continuation or second
+dispute.
+
+**Applying the ruling.** `applyRuling()` can be called by anyone while the order is `Disputed`. It reads
+`court.rulingOf(disputeId)` for the order's own stored `disputeId`, never an argument, and reverts with
+`RulingNotReady` until the court has resolved. It sets the order to `Terminated` and credits, with `D` the disputed
+milestone, `R` the later unsettled milestones and `fee(x) = floor(x * feeBps / 10_000)`:
+
+| Ruling (reason) | Freelancer | Fee recipient | Client |
+| --- | --- | --- | --- |
+| `FreelancerWins` (`Majority` or `NoPanel`) | `D - fee(D)` | `fee(D)` | `R` |
+| `ClientWins` (`Majority`) | `0` | `0` | `D + R` |
+| `Split` (`NoDecision`) | `floor(D/2) - fee(floor(D/2))` | `fee(floor(D/2))` | `D - floor(D/2) + R` |
+
+Credits add up when roles share an address, and always sum to `D + R`. `applyRuling` moves no tokens and leaves
+`outstandingObligations` unchanged; every party collects through `claimPayout`, as after delivery expiry. The order
+does not advance: the disputed milestone stays `Disputed`, later milestones stay `Pending`, and the terminal status
+voids them. `NoPanel` (no panel formed before `panelDeadline`) pays the submitted work as if it had not been disputed,
+and the court refunds the client's dispute fee as a court credit.
+
+**Nonces.** `approvalNonce == settledCount + (status == Disputed || status == Terminated ? 1 : 0)`. Opening a dispute
+and delivery-expiry reclaim each consume one nonce; `applyRuling`, claims and failed transactions consume none. A
+signature for the disputed milestone, or a pre-signed one for a later milestone whose nonce now matches numerically,
+fails on the order status for good. The EIP-712 message and domain are unchanged.
 
 ## Signed approvals
 
@@ -180,15 +243,16 @@ can be submitted again once the transfer can succeed.
 
 `approvalNonce` is a single order-wide counter that starts at `0` and increases by exactly one on every successful
 settlement, whether it came from `approveMilestone`, `approveMilestoneBySignature` or `finalizeMilestone`, and once
-more when the order is terminated by `reclaimAfterDeliveryExpiry`. Claims do not change it:
+more when the order leaves the settlement path through `openDispute` or `reclaimAfterDeliveryExpiry`. Rulings and
+claims do not change it:
 
 ```
 currentMilestone == settlementCount
-approvalNonce    == settlementCount + (status == Terminated ? 1 : 0)
+approvalNonce    == settlementCount + (status == Disputed || status == Terminated ? 1 : 0)
 ```
 
-While the order is active the signature for milestone `i` must therefore carry nonce `i`. After termination every
-signature fails on the order status, including one that happens to match the incremented nonce.
+While the order is active the signature for milestone `i` must therefore carry nonce `i`. Once the order is disputed
+or terminated every signature fails on the order status, including one that happens to match the incremented nonce.
 
 - **Same milestone twice:** after settlement the milestone is no longer current and the nonce has moved on.
 - **Another milestone:** the index is part of the signed message.
@@ -260,6 +324,7 @@ fee-recipient transfer entirely. The fee is capped at 1,000 bps.
 | --- | --- |
 | `Unfunded` | `0` |
 | `Active` | sum of unsettled milestone amounts |
+| `Disputed` | sum of unsettled milestone amounts (the disputed one and every later one) |
 | `Completed` | `0` |
 | `Terminated` | sum of unclaimed credits |
 
@@ -296,12 +361,18 @@ target).
 ## Security notes
 
 - `SafeERC20` for every transfer; `ReentrancyGuard` on `fund`, `fundWithPermit`, `submitMilestone`,
-  `approveMilestone`, `approveMilestoneBySignature`, `finalizeMilestone`, `reclaimAfterDeliveryExpiry` and
-  `claimPayout`.
-- Checks-effects-interactions: status, obligations and milestone index are updated before tokens move. Funding
-  additionally checks the received amount after the transfer.
+  `approveMilestone`, `approveMilestoneBySignature`, `finalizeMilestone`, `reclaimAfterDeliveryExpiry`,
+  `openDispute`, `applyRuling` and `claimPayout`.
+- Checks-effects-interactions: status, obligations and milestone index are updated before tokens move or the court
+  is called. `openDispute` sets `Disputed` and consumes the nonce before calling the court, so a token callback that
+  re-enters the order during the fee pull is rejected by the order's guard and, if it reached another function, by
+  the `Disputed` status. A stake-token callback during `court.resolve` may call `applyRuling` and sees the ruling
+  already recorded. Funding additionally checks the received amount after the transfer.
+- The order trusts only its immutable `court` and only the `disputeId` that court returned to it.
 - Custom errors for all failures; events `Funded`, `MilestoneSubmitted`, `MilestoneSettled`, `OrderCompleted`,
-  `DeliveryExpired(index, clientCredit)` and `PayoutClaimed(account, amount)` for every lifecycle change. A signed approval additionally emits
+  `DeliveryExpired(index, clientCredit)`, `DisputeOpened(index, disputeId, consumedNonce)`,
+  `RulingApplied(disputeId, ruling, reason, clientCredit, freelancerCredit, feeCredit)` and
+  `PayoutClaimed(account, amount)` for every lifecycle change. A signed approval additionally emits
   `MilestoneApprovedBySignature(index, client, relayer, nonce)` before `MilestoneSettled`, whose `settledBy` is the
   relayer.
 - Timestamps are stored as `uint64` via `SafeCast`.
@@ -397,9 +468,9 @@ transaction, gives the higher, more realistic figures in the isolated columns. E
 ## Arbitration court
 
 `ArbitrationCourt` is slice S3 of the arbitration design (sections 2, 4, 6, 7, 9 and 11). It is deployed by the
-contract that becomes its immutable `factory`, and it deploys its own immutable `ArbitratorRegistry`. In this stage
-the factory and the orders are test mocks (`MockArbitrationFactory`, `MockDisputableOrder`); the production
-`TrustWorkFactory` and `WorkOrder` do not call the court yet.
+contract that becomes its immutable `factory`, and it deploys its own immutable `ArbitratorRegistry`. In production
+that factory is `TrustWorkFactory` and its orders open disputes (see [Disputes](#disputes)); the court's own test
+suite uses the mocks `MockArbitrationFactory` and `MockDisputableOrder`.
 
 **Construction.** `stakeToken` (nonzero, has code), `disputeFee` and `seatLock` (positive) and `penaltyRecipient`
 (nonzero). The registry's own checks apply unchanged: `penaltyRecipient` cannot be the court or the registry, and
@@ -489,8 +560,20 @@ transaction, gives the higher, more realistic figures in the isolated columns. E
 | `resolve`, panel, 3 valid reveals | 200,090 (was 200,660) | 200,090 (was 200,660) | ≤ 400,000 |
 | `resolve`, `NoPanel` from `AwaitingSeed` | 424,944 | 424,944 | ≤ 800,000 |
 
-**Sizes** (optimized build): `ArbitrationCourt` 10,616 B runtime and 20,745 B initcode (the initcode embeds the
-registry's creation code), `ArbitratorRegistry` 8,667 B / 9,364 B.
+Through the production order (`test/integration/TrustWorkIntegration.gas.t.sol`, same cooling, all 32 candidates
+holding only matured warming stake), the client's `WorkOrder.openDispute` call measures 1,672,706 gas, or 1,522,298
+with `--isolate`, in both token configurations (target ≤ 2,000,000).
+
+**Sizes** (optimized build, EIP-170 runtime limit 24,576 B, EIP-3860 initcode limit 49,152 B):
+
+| Contract | Runtime | Initcode |
+| --- | --- | --- |
+| `TrustWorkFactory` | 13,668 B | 34,735 B (embeds the court and registry creation code; the runtime embeds the `WorkOrder` creation code) |
+| `WorkOrder` | 9,849 B | 12,427 B |
+| `ArbitrationCourt` | 10,616 B | 20,745 B (embeds the registry creation code) |
+| `ArbitratorRegistry` | 8,667 B | 9,364 B |
+
+`test_Sizes_WithinDeploymentLimits` checks the deployed runtimes and the factory initcode in the ordinary build.
 
 ## Development
 
@@ -512,7 +595,11 @@ tests live in `test/registry/` (unit, matrix M0, fuzz against a reference model,
 `test/invariant/ArbitratorRegistry*.sol`; `test/mocks/RegistryCourtHarness.sol` stands in for the court. Court tests
 live in `test/court/` (unit, matrices M1 and M2, fuzz, gas) and `test/invariant/ArbitrationCourt*.sol`, with
 `test/mocks/MockArbitrationFactory.sol` and `test/mocks/MockDisputableOrder.sol` in place of the production factory and
-order.
+order. Production integration tests live in `test/integration/` (unit cases I-01…I-22, matrices M3–M7, fuzz, gas)
+and `test/invariant/TrustWorkIntegration*.sol`. Each runs twice, with one token for escrow and stake
+(`SharedToken`) and with separate tokens (`SplitToken`). `test/utils/TransferLedger.sol` records every token
+transfer during each protocol action, requires it to match the edges the test's own model expects for that
+transition, and keeps an independent per-contract ledger of liabilities and unsolicited balance.
 `test/WorkOrder.delivery.t.sol` also contains a deterministic matrix of every funding path × reclaim at the first,
 middle and last milestone (9 cases); fuzz and invariant runs sample combinations rather than enumerating them. Mocks under `test/mocks/`
 are test-only: `MockUSDC` (6 decimals, open minting), `MockPermitUSDC` (adds ERC-2612), a fee-on-transfer token, a
@@ -523,16 +610,21 @@ Run `forge test --match-path 'test/invariant/*' -vv` to print a per-campaign sum
 the final run (funding path, settlement paths, rejected stale signatures and expired submissions, reclaims,
 claims). `test_RandomCampaignsReachEveryTransition` in the court invariant suite replays 64 fixed pseudo-random
 campaigns through the same handler, checks every court invariant after each call, and prints the summed transition
-counts.
+counts; the integration invariant suite has the same test (32 campaigns of 128 calls) for funding paths, settlement
+paths, terminal states, rulings by reason, stale signatures and claims.
+
+Coverage instruments and enlarges bytecode, so `test_Sizes_WithinDeploymentLimits` fails under `forge coverage`
+(instrumented factory initcode 59,185 B). Functional coverage is therefore reported with that one test filtered:
+
+```sh
+forge coverage --no-match-test test_Sizes_WithinDeploymentLimits
+```
 
 ## Current limitations
 
 Not implemented in this stage:
 
-- disputes on real orders — a submitted milestone is either approved or auto-released after the review period, and
-  the client can only reclaim milestones that were never submitted in time. The arbitrator registry and court exist,
-  but `WorkOrder` and `TrustWorkFactory` neither open disputes nor apply rulings (slice S4 in
-  [`docs/stage-3-arbitration-design.md`](docs/stage-3-arbitration-design.md));
+- appeals, resubmission after a dispute, or more than one dispute per order;
 - cancellation by agreement, and any refund other than delivery-expiry reclaim;
 - recovery of unsolicited tokens sent directly to an order;
 - reputation, governance, frontend, deployment scripts, and a relayer service.
@@ -550,10 +642,15 @@ Stage 3B caveats:
   also delays the next delivery deadline.
 - Orders deployed by the Stage 1/2 factory have no delivery period and cannot be reclaimed.
 
-Stage 3D caveats:
+Stage 3E caveats:
 
-- The court trusts its factory's `isWorkOrder` and the order's party getters; with the test mocks any caller can make
-  an order open a dispute. Who may open a dispute, and when, is enforced by the order in slice S4.
-- A ruling is recorded in the court only; nothing moves escrowed order funds yet.
+- `NoPanel` pays the submitted work when no panel forms; an honest client gets no protection from an empty or
+  exhausted court (design §11.1).
+- Penalties do not bound bribery or strategic non-reveal when the disputed amount greatly exceeds `seatLock`
+  (design §10.4).
+- Address checks cannot detect that a party, an arbitrator and `penaltyRecipient` share a controller.
+- Orders from the Stage 1/2 factories have no court and cannot be disputed; the Stage 3 factory does not adopt them.
+- The status enums changed: `OrderStatus` gains `Disputed` before `Completed`, so `Completed` and `Terminated` have
+  new numeric values, and `MilestoneStatus` gains `Disputed` at the end.
 
 The milestone count has no explicit cap; creation gas grows linearly with it and is paid by the client.

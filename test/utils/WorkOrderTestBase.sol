@@ -13,6 +13,8 @@ abstract contract WorkOrderTestBase is Test {
     uint256 internal constant DEFAULT_FEE_BPS = 250;
     uint256 internal constant DEFAULT_REVIEW_PERIOD = 7 days;
     uint256 internal constant DEFAULT_DELIVERY_PERIOD = 14 days;
+    uint256 internal constant DISPUTE_FEE = 20 * USDC;
+    uint256 internal constant SEAT_LOCK = 100 * USDC;
 
     bytes32 internal constant EIP712_DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
@@ -26,14 +28,15 @@ abstract contract WorkOrderTestBase is Test {
     address internal freelancer = makeAddr("freelancer");
     address internal feeRecipient = makeAddr("feeRecipient");
     address internal stranger = makeAddr("stranger");
+    address internal penaltyRecipient = makeAddr("penaltyRecipient");
 
     TrustWorkFactory internal factory;
     MockUSDC internal usdc;
 
     function setUp() public virtual {
         (client, clientKey) = makeAddrAndKey("client");
-        factory = new TrustWorkFactory();
         usdc = new MockUSDC();
+        factory = new TrustWorkFactory(usdc, DISPUTE_FEE, SEAT_LOCK, penaltyRecipient);
     }
 
     function _defaultAmounts() internal pure returns (uint256[] memory amounts) {

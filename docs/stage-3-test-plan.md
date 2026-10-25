@@ -472,3 +472,67 @@ the handler's own record of commits and reveals. The court invariant campaign st
 stake for three seats each, deposited through the handler; without it random sequences rarely form a panel.
 `test_RandomCampaignsReachEveryTransition` replays 64 fixed pseudo-random campaigns of 64 calls through the same
 handler, checks all invariants after every call and asserts that each core transition was reached.
+
+## 13. S4 implementation map
+
+Every integration suite is abstract and runs twice: `SharedToken` (one token for escrow and stake) and `SplitToken`
+(separate stake token). `test/utils/TransferLedger.sol` observes every `Transfer` of either token during each
+protocol action, requires the observed transfers to equal the edges the test's own model expects for that action's
+transition (§11.4), books them into an independent per-contract, per-token ledger of liabilities and unsolicited
+balance, and fails on any transfer not produced by the authorized transition. Expected fees use
+`floor(x / 10_000) · bps + floor((x mod 10_000) · bps / 10_000)`, not `WorkOrder.feeFor`.
+
+Deviations: I-17's stake-token case uses a new `CallbackToken` (trigger and call target are independent, so a
+transfer between client and court can call the order) instead of `ReentrantToken`; it also covers §6.5's callback
+during `resolve`, which may call `applyRuling` and sees the recorded ruling. I-16 uses a new `MockExecutingWallet`
+that executes approvals and order calls and validates its owner's ECDSA signatures through ERC-1271. I-19 is a test
+on deployed code length and factory creation code; it fails under coverage instrumentation, so functional coverage
+runs with that one test filtered.
+
+| Cases | Test (`test/integration/TrustWorkIntegration.t.sol` unless noted) |
+| --- | --- |
+| I-01 | `test_Factory_DeploysAndWiresCourtAndRegistry`, `test_RevertWhen_FactoryCourtParametersInvalid` |
+| I-02 | `test_IsWorkOrder_OnlyOrdersThisFactoryCreated` (also: another factory, a reverted creation, and a directly deployed order rejected by the court with `UnknownOrder`) |
+| I-03 | `test_RevertWhen_PenaltyRecipientIsParty` |
+| I-04 | `test_RevertWhen_OpenDisputeByNonClientOrInWrongOrderStatus` |
+| I-05 | `test_RevertWhen_OpenDisputeOnPendingOrNonCurrentMilestone` |
+| I-06 | `test_OpenDispute_ReviewDeadlineBoundary` |
+| I-07 | `test_Race_ApprovalAndDisputeOneSecondBeforeReviewDeadline` (direct and signed, both orders) |
+| I-08 | `test_Race_DisputeFinalizeAndApprovalAtReviewDeadline` |
+| I-09 | `test_OpenDispute_ConsumesOneNonceAndReportsIt` |
+| I-10 | `test_StaleSignatures_RejectedWhileDisputedAndAfterRuling` |
+| I-11 | `test_RevertWhen_CourtFeeCannotBePulledEverythingRollsBack` (allowance to the order only, short allowance, no balance) |
+| I-12 | `test_RevertWhen_BlockedFunctionsCalledWhileDisputed` |
+| I-13 | `test_ApplyRuling_CreditsEachReasonAfterResolution`, `test_ApplyRuling_IgnoresOtherDisputes` |
+| I-14 | `test_Claims_BlockedFreelancerDoesNotBlockOtherClaims` |
+| I-15 | `test_FeeRecipientIsClient_CreditsAccumulateInOneEntry` |
+| I-16 | `test_ContractClient_ApprovesCourtAndOpensDispute` |
+| I-17 | `test_Reentrancy_PaymentTokenCallbackDuringClaimIsBlocked`, `test_Reentrancy_StakeTokenCallbackDuringFeePullIsBlocked`, `test_StakeTokenCallbackDuringResolveCanApplyRecordedRuling` |
+| I-18 | `test_Donations_DuringDisputeCreateNoLiabilityOrCredit` |
+| I-19 | `test_Sizes_WithinDeploymentLimits`; `forge build --sizes` |
+| I-20 | `test_EmptyCourt_NoPanelEqualsNotDisputing` |
+| I-21 | `test_Trace_EquationsAfterEveryStep` |
+| I-22 | `test_ProtocolContractRecipients_ReceiveUnsolicitedBalanceOnly` |
+| near-max amounts | `test_NearMaxEscrow_RulingsCreditAndClaimExactly` (total `type(uint256).max - 1e15`) |
+| M3 | `TrustWorkIntegration.matrix.t.sol`: `test_MatrixM3_RulingByDisputePosition` (asserts 15 cases) |
+| M4 | `test_MatrixM4_FundingByTerminalPath` (asserts 21 cases) |
+| M5 | `test_MatrixM5_SettlementPathPerMilestone` (asserts 27 cases) |
+| M6 | `test_MatrixM6_Boundaries` (asserts 48 cases: delivery 6, review 9, signature 3, panel 12, seed block 3, commit 6, reveal 6, activation 3) |
+| M7 | `test_MatrixM7_TokenConfigurationByTerminalPath` (7 cases in each configuration, 14 in total) |
+| IF-01 | `TrustWorkIntegration.fuzz.t.sol`: `testFuzz_RulingCreditsSumToDisputedAndRemaining` |
+| IF-02 | `testFuzz_LifecycleKeepsNonceAndConservation` |
+| II-01 | `test/invariant/TrustWorkIntegration.invariant.t.sol`: `invariant_OrderFundsConserved` |
+| II-02, II-07 | `invariant_BalancesAndProvenance` (and the ledger check inside every handler action) |
+| II-03 | `invariant_OutstandingMatchesStatus` |
+| II-04 | `invariant_NonceInvariant` |
+| II-05 | `invariant_CourtAccounting` |
+| II-06 | `invariant_RegistryAccounting` |
+| II-08 | `invariant_AtMostOneDisputePerOrder` |
+
+`afterInvariant` passes every deadline, resolves every dispute, applies every ruling and claims every credit, then
+requires that no order is still `Disputed`, the court holds no pending fee or credit, and no stake is locked or
+reserved. The campaign starts from five arbitrators with matured stake for three seats each and two orders.
+`test_RandomCampaignsReachEveryTransition` replays 32 fixed campaigns of 128 calls with every invariant checked after
+each call and asserts that each funding path, settlement path, terminal state, ruling by reason, stale-signature
+rejection and claim was reached. `test/integration/TrustWorkIntegration.gas.t.sol` measures the production
+`WorkOrder.openDispute` with 32 all-warming candidates against the 2,000,000 target.
