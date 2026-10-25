@@ -246,6 +246,7 @@ S4 measures both.
 | Client and freelancer differ | order constructor (Stage 1) | `ClientIsFreelancer` |
 | Fee recipient is not the order itself | order constructor (S1) | `FeeRecipientIsOrder` |
 | `penaltyRecipient` is neither the court nor the registry | registry constructor (S2) | `PenaltyRecipientIsProtocol` |
+| `penaltyRecipient` is not the factory | court constructor (S3) | `PenaltyRecipientIsFactory` |
 
 **Limitation.** These are address checks. Nothing on-chain can detect that different addresses share a controller:
 a party, an arbitrator and `penaltyRecipient` may be the same person behind different addresses.
@@ -584,7 +585,24 @@ Meeting the snapshot target required packing the account into three slots (`uint
   capacity `MAX_PRINCIPAL - (stake + warming)` in `uint256` and rejects any larger amount with
   `PrincipalLimitExceeded(amount, capacity)`, so maturation, withdrawal and snapshots can never overflow.
 
-The `Account` view in section 6.3 keeps `uint256` fields. The court-level targets for `openDispute`, `drawPanel` and `resolve` remain for S3.
+The `Account` view in section 6.3 keeps `uint256` fields.
+
+S3 measurements (32 candidates; court, registry, token, mock factory and mock order storage marked cold with
+`vm.cool`; one external call from the test, which for `openDispute` is the mock order's forwarding call; excluding
+intrinsic and calldata cost):
+
+| Operation | Mixed (16 materialized, 16 matured warming) | All 32 matured warming | Target |
+| --- | --- | --- | --- |
+| `openDispute`, first dispute | 1,835,772 | 2,170,188 (missed by 170,188) | ≤ 2,000,000 |
+| `openDispute`, after an earlier dispute | — | 1,993,488 | ≤ 2,000,000 |
+| successful `retrySnapshot` | 1,526,825 | 1,861,241 | ≤ 2,000,000 |
+| `drawPanel` | 394,511 | 374,611 | ≤ 800,000 |
+| `resolve` with `NoPanel` from `AwaitingSeed` | 221,240 | 221,240 | ≤ 800,000 |
+| `resolve` with a panel (3 faulty seats / 3 reveals) | 204,259 / 176,856 | 201,459 / 176,856 | ≤ 400,000 |
+
+The all-warming first `openDispute` misses its target: the S2 snapshot alone costs 1,911,409 there, leaving about
+85,000 gas for the fee pull, the dispute record and the court's first writes to its counters. Meeting it needs a
+cheaper snapshot, a lower `MAX_ARBITRATORS` or a revised target, all outside S3; the item is open for review.
 
 Selection is implemented in `PanelSelection.selectIndexes(seed, n)`, which reverts with `TooFewCandidates` for
 `n < 3`; the registry takes the seed from the court and never fetches block data.

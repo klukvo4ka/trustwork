@@ -417,3 +417,58 @@ around `type(uint128).max`), RI-08 (principal within limit) and an all-warming g
 
 The registry invariant campaign starts from four funded and activated actors (set up through the handler so the
 ghost model records them); without that seed state, random sequences almost never formed a snapshot.
+
+## 12. S3 implementation map
+
+Deviations in S3: C-24 uses `BlocklistToken` blocking the court as recipient instead of a `PausableMockToken` (the
+registry's penalty transfer to the court fails; "unpause" is unblocking). C-01 also covers the registry's own
+restrictions surfacing through the court constructor and the added `PenaltyRecipientIsFactory`. C-26 enforces every
+target except the all-warming first `openDispute`, which is logged as missed (2,170,188 against 2,000,000; see the
+design, section 7.5).
+
+| Cases | Test (`test/court/ArbitrationCourt.t.sol` unless noted) |
+| --- | --- |
+| C-01 | `test_Constructor_WiresFactoryRegistryAndTerms`, `test_RevertWhen_ConstructorInputsInvalid`, `test_RevertWhen_RegistryRestrictionsViolated` |
+| C-02 | `test_RevertWhen_OpenedByUnknownOrder` |
+| C-03 | `test_OpenDispute_PullsExactFee`, `test_RevertWhen_FeeCannotBePulled`, `test_RevertWhen_FeeTokenTakesTransferFee` |
+| C-04 | `test_OpenDispute_StoresSnapshotAndArmsSelection`, `test_OpenDispute_WithTooFewCandidatesAwaitsCandidates` |
+| C-05 | `test_RetrySnapshot_SucceedsOnceCandidatesExist` |
+| C-06 | `test_RetrySnapshot_PanelDeadlineBoundary` |
+| C-07 | `test_DrawPanel_SelectionBlockBoundary` |
+| C-08 | `test_DrawPanel_ExpiredBlockhashRearmsSameSnapshot` |
+| C-09 | `test_DrawPanel_IgnoresRegistryChangesAfterSnapshot` |
+| C-10 | `test_DrawPanel_PanelDeadlineBoundaryAndNoPanelResolution`, `test_DrawPanel_AllowedOneSecondBeforePanelDeadline` |
+| C-11 | `test_NoPanel_ReleasesReservationsWithoutPenalties` |
+| C-12 | `test_RevertWhen_PanelDrawnTwice`, `test_RevertWhen_UnknownDispute` |
+| C-13 | `test_RevertWhen_CommitInvalid` |
+| C-14 | `test_Commit_DeadlineBoundary` |
+| C-15 | `test_Reveal_PhaseBoundaries` |
+| C-16 | `test_RevertWhen_RevealDoesNotMatchThenRetrySucceeds`, `test_RevertWhen_CommitmentFromAnotherDomainIsRevealed` |
+| C-17 | `test_RevealVote_RejectsRawValuesOutsideVoteRange` |
+| C-18 | `test_RevertWhen_RevealRepeatedOrUncommitted` |
+| C-19 | `test_VoteCommitment_MatchesIndependentEncoding` |
+| C-20 | `test_Resolve_RevealDeadlineBoundaryAndNoEarlyResolution` |
+| C-21 | `test_Resolve_WorkedExampleRows` |
+| C-22 | `test_FeeShareGrowsWhenAnotherSeatFaults` |
+| C-23 | `test_ClaimReward_PaysAccountAndIsolatesFailures` |
+| C-24 | `test_RevertWhen_PenaltyTransferFailsResolutionIsAtomic`, `test_RevertWhen_PenaltyReceiptDiffersFromPenalties` |
+| C-25 | `test_ConcurrentDisputes_FaultIsolatedToItsDispute`, `test_Donations_CreateNoCredits` |
+| C-26 | `ArbitrationCourt.gas.t.sol`: mixed and all-warming `test_Gas_CourtEntryPoints`, `test_Gas_RetrySnapshotAllWarming`, `test_Gas_RetrySnapshotMixed`, `test_Gas_OpenDisputeAllWarmingAfterEarlierDispute` |
+| C-27 | `test_Reentrancy_DuringFeePullPenaltyTransferAndClaim` |
+| M1 | `ArbitrationCourt.matrix.t.sol`: `test_MatrixM1_AllRevealPatterns` (asserts 125 cases) |
+| M2 | `test_MatrixM2_PanelAvailability` (asserts 10 cases) |
+| CF-01 | `ArbitrationCourt.fuzz.t.sol`: `testFuzz_ResolutionConservesFeesAndPenalties` |
+| CF-02 | `testFuzz_OnlyTheAllowedActionSucceedsAtEachBoundary` (panel deadline, commit deadline, reveal deadline, selection block, each at offsets −2…+2) |
+| CI-01 | `test/invariant/ArbitrationCourt.invariant.t.sol`: `invariant_CourtFlowsBalance` |
+| CI-02 | `invariant_BalanceIsLiabilitiesPlusDonations` |
+| CI-03 | `invariant_PendingFeesMatchUnresolvedDisputes` |
+| CI-04 | `invariant_PenaltiesMatchRegistry` |
+| CI-05 | `invariant_RegistryCommitmentsMatchDisputes` |
+| CI-06 | `invariant_RulingsAndSnapshotsMatchHistory` |
+| CI-07 | `afterInvariant` (warps past every deadline, resolves every dispute, then claims every credit) |
+
+`invariant_CreditsMatchGhosts` additionally compares each account's credit with an independent ghost computed from
+the handler's own record of commits and reveals. The court invariant campaign starts from six actors with matured
+stake for three seats each, deposited through the handler; without it random sequences rarely form a panel.
+`test_RandomCampaignsReachEveryTransition` replays 64 fixed pseudo-random campaigns of 64 calls through the same
+handler, checks all invariants after every call and asserts that each core transition was reached.
