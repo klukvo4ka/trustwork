@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {TrustWorkFactory} from "../../src/TrustWorkFactory.sol";
 import {TrustWorkReputation} from "../../src/TrustWorkReputation.sol";
 import {WorkOrder} from "../../src/WorkOrder.sol";
@@ -9,8 +10,12 @@ import {ITrustWorkReputation} from "../../src/interfaces/ITrustWorkReputation.so
 import {MockPermitUSDC} from "../mocks/MockPermitUSDC.sol";
 import {MockReputationCourt, MockReputationFactory, MockReputationOrder} from "../mocks/MockReputationSources.sol";
 import {ReputationTestBase} from "../utils/ReputationTestBase.sol";
+import {TransferLedger} from "../utils/TransferLedger.sol";
 
 abstract contract TrustWorkReputationTest is ReputationTestBase {
+    uint256 internal constant NEAR_MAX_HEADROOM = 1e15;
+    uint256 internal constant NEAR_MAX_TOTAL = type(uint256).max - NEAR_MAX_HEADROOM;
+
     event OrderRegistered(
         address indexed order, ITrustWorkReputation.Outcome outcome, address indexed client, address indexed freelancer
     );
@@ -391,11 +396,13 @@ abstract contract TrustWorkReputationTest is ReputationTestBase {
         assertEq(split.clientReturned, 4 + 3000 * USDC);
     }
 
-    /// @dev RS-02: a second registration of every outcome reverts and changes nothing.
+    /// @dev RS-02: a second registration of every outcome, including DeliveryExpired, reverts and changes nothing.
     function test_RevertWhen_RegisteredTwice() public {
-        for (uint256 o; o < 6; ++o) {
+        for (uint256 o; o < 7; ++o) {
             uint256 state = vm.snapshotState();
-            Scenario memory s = o == 5 ? _completed(_defaultAmounts()) : _ruled(_defaultAmounts(), 1, Outcome(o));
+            Scenario memory s = o == 5
+                ? _completed(_defaultAmounts())
+                : o == 6 ? _expired(_defaultAmounts(), 1) : _ruled(_defaultAmounts(), 1, Outcome(o));
             reputation.register(address(s.order));
             bytes32 before = _reputationState(address(s.order));
             vm.warp(block.timestamp + 1 days);
@@ -560,32 +567,91 @@ abstract contract TrustWorkReputationTest is ReputationTestBase {
         }
     }
 
-    /// @dev RN-01, RN-02: near-maximum totals register exactly, twice for the same accounts, with no aggregate to
-    /// overflow.
-    function test_NearMaximumTotals_RegisterWithoutOverflow() public {
-        uint256 total = (type(uint256).max - 1e15) / 2;
-        uint256[] memory amounts = new uint256[](3);
-        amounts[0] = 1000 * USDC;
-        amounts[1] = (total - amounts[0]) / 2 + 1;
-        amounts[2] = total - amounts[0] - amounts[1];
-        Outcome[3] memory rulings = [Outcome.SplitByTie, Outcome.FreelancerMajority, Outcome.ClientMajority];
-        for (uint256 o; o < 3; ++o) {
+    /// @dev RN-01: every eligible outcome of a genuine order whose total is `type(uint256).max - NEAR_MAX_HEADROOM`.
+    function test_NearMaximumTotal_EveryOutcome() public {
+        uint256[] memory amounts = _nearMaximumAmounts();
+        uint256 cases;
+        for (uint256 o; o < 7; ++o) {
             uint256 state = vm.snapshotState();
-            Scenario memory first = _ruled(amounts, 1, rulings[o]);
-            Scenario memory second = _ruled(amounts, 1, rulings[o]);
-            ITrustWorkReputation.OrderFacts memory facts = _register(first);
-            _register(second);
-            assertEq(facts.totalAmount, total);
-            assertEq(facts.freelancerAwarded + facts.clientReturned, total);
-            ITrustWorkReputation.Stats memory stats = _statsOf(freelancer, FREELANCER_ROLE);
-            assertEq(stats.registered, 2);
+            Scenario memory s;
+            if (o == 0) s = _completed(amounts);
+            else if (o == 1) s = _expired(amounts, 1);
+            else s = _ruled(amounts, 1, Outcome(o - 2));
+            ITrustWorkReputation.OrderFacts memory facts = _register(s);
+            assertEq(facts.totalAmount, NEAR_MAX_TOTAL);
+            assertEq(facts.freelancerAwarded + facts.clientReturned, NEAR_MAX_TOTAL);
+            _assertStats(client, CLIENT_ROLE, _one(s.outcome), s.settled);
+            _assertStats(freelancer, FREELANCER_ROLE, _one(s.outcome), s.settled);
             vm.revertToState(state);
+            ++cases;
         }
-        Scenario memory completedFirst = _completed(amounts);
-        Scenario memory completedSecond = _completed(amounts);
-        _register(completedFirst);
-        _register(completedSecond);
-        assertEq(_statsOf(client, CLIENT_ROLE).completed, 2);
+        assertEq(cases, 7);
+    }
+
+    /// @dev RN-02: two genuine completed orders with the same parties and token whose combined total exceeds
+    /// `type(uint256).max`. The second is funded with the first order's payouts, recycled by ordinary transfers, so the
+    /// token supply stays representable.
+    function test_AggregateVolumeAboveUint256_RegistersBothOrders() public {
+        uint256[] memory amounts = _nearMaximumAmounts();
+        Scenario memory first = _completed(amounts);
+        _recycleToClient(freelancer);
+        _recycleToClient(feeRecipient);
+        assertEq(paymentToken.balanceOf(client), NEAR_MAX_TOTAL);
+        Scenario memory second = _completedFromClientBalance(amounts);
+
+        assertEq(first.order.totalAmount(), NEAR_MAX_TOTAL);
+        assertEq(second.order.totalAmount(), NEAR_MAX_TOTAL);
+        assertGt(first.order.totalAmount(), type(uint256).max - second.order.totalAmount());
+        assertLe(paymentToken.totalSupply(), type(uint256).max);
+
+        _register(first);
+        _register(second);
+        uint256[6] memory twoCompleted = [uint256(2), 0, 0, 0, 0, 0];
+        _assertStats(client, CLIENT_ROLE, twoCompleted, 6);
+        _assertStats(freelancer, FREELANCER_ROLE, twoCompleted, 6);
+        address[] memory clientOrders = reputation.ordersOf(client, CLIENT_ROLE, 0, 10);
+        address[] memory freelancerOrders = reputation.ordersOf(freelancer, FREELANCER_ROLE, 0, 10);
+        assertEq(clientOrders.length, 2);
+        assertEq(clientOrders[0], address(first.order));
+        assertEq(clientOrders[1], address(second.order));
+        assertEq(freelancerOrders.length, 2);
+        assertEq(freelancerOrders[0], address(first.order));
+        assertEq(freelancerOrders[1], address(second.order));
+        _assertFacts(reputation.factsOf(address(first.order)), _expectedFacts(first));
+        _assertFacts(reputation.factsOf(address(second.order)), _expectedFacts(second));
+    }
+
+    /// @dev Three milestones summing to `NEAR_MAX_TOTAL`, with a small first milestone so expiry and disputes at
+    /// milestone 1 leave a large settled part and a large disputed part.
+    function _nearMaximumAmounts() private pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](3);
+        amounts[0] = 1000 * USDC;
+        amounts[1] = (NEAR_MAX_TOTAL - amounts[0]) / 2 + 1;
+        amounts[2] = NEAR_MAX_TOTAL - amounts[0] - amounts[1];
+    }
+
+    function _recycleToClient(address holder) private {
+        uint256 balance = paymentToken.balanceOf(holder);
+        vm.prank(holder);
+        assertTrue(paymentToken.transfer(client, balance));
+    }
+
+    /// @dev Like `_completed`, but funds the order from the client's existing balance instead of minting.
+    function _completedFromClientBalance(uint256[] memory amounts) private returns (Scenario memory s) {
+        s.order = _createOrder(client, feeRecipient, amounts);
+        s.amounts = amounts;
+        vm.warp(block.timestamp + STEP);
+        s.fundedAt = SafeCast.toUint64(block.timestamp);
+        uint256 total = s.order.totalAmount();
+        vm.prank(client);
+        paymentToken.approve(address(s.order), total);
+        ledger.begin();
+        vm.prank(client);
+        s.order.fund();
+        _end(TransferLedger.Transition.Fund, client, address(s.order), total);
+        _settleFirst(s, amounts.length);
+        s.outcome = ITrustWorkReputation.Outcome.Completed;
+        s.closedNotBefore = s.lastSubmittedAt;
     }
 
     /// @dev RN-03: one-unit milestones and the fee bounds.

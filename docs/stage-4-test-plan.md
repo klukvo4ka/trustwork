@@ -204,14 +204,15 @@ drives production orders and records times and amounts itself.
 | RG-06 | `test_Hiding_LosingPartyCannotBlockOrUndo` |
 | RG-07, RG-08 | `test_WashAndNegligibleOrders_RegisterWithInspectableFacts` |
 | RS-01, RS-10 | `test_WorkedExamples` |
-| RS-02 | `test_RevertWhen_RegisteredTwice` |
+| RS-02 | `test_RevertWhen_RegisteredTwice` (all six outcomes: four panel rulings and `NoPanel` at the middle milestone, `Completed`, and `DeliveryExpired` after participation) |
 | RS-03 | `test_RoleOverlap_FeeRecipientPositionGrantsNothing` |
 | RS-04 | `test_RoleStatistics_SeparatePerRole` |
 | RS-05, RS-06, RS-07, RS-09 | `test_Statistics_PartitionMilestonesAndDerivedShares` |
 | RS-08, RS-11, RS-12 | `test_OrdersOf_PagingBoundaries` |
 | RU-01 | `test_Register_LeavesEscrowCourtAndRegistryUnchanged` |
 | RU-02, RU-03 | `test_Claims_IdenticalWithOrWithoutRegistration` |
-| RN-01, RN-02 | `test_NearMaximumTotals_RegisterWithoutOverflow` |
+| RN-01 | `test_NearMaximumTotal_EveryOutcome` (order total `type(uint256).max - 1e15`; `Completed`, `DeliveryExpired`, `FreelancerWins`, `ClientWins`, `Split` by tie and by zero reveals, `NoPanel`; 7 cases) |
+| RN-02 | `test_AggregateVolumeAboveUint256_RegistersBothOrders` (two completed orders, same factory, parties and token, each `type(uint256).max - 1e15`; the second funded by recycling the first's payouts; asserts `firstTotal > type(uint256).max - secondTotal`) |
 | RN-03 | `test_UnitMilestonesAndFeeBounds` |
 | RN-04 | `test_ManyMilestones_Completed` |
 | RF-01 | `TrustWorkReputation.fuzz.t.sol`: `testFuzz_FactsMatchModel` |
@@ -228,3 +229,9 @@ checks all Stage 3E and reputation invariants after every call, registers every 
 outcome and every rejection reason (`OrderNotFinal`, `NoParticipation`, `AlreadyRegistered`, `UnknownOrder`). The
 inherited Stage 3E replay keeps its original call mix. `TrustWorkReputation.gas.t.sol` reports registration gas for
 representative outcomes without a threshold.
+
+Invariant results are reported per configured campaign: `runs = 256`, `depth = 64` (`foundry.toml`), so each
+campaign makes 16,384 handler calls, and Foundry 1.5.1 prints one line per declared invariant property with the
+campaign's call and revert counts. Declared properties (functions), concrete property executions (a property in each
+concrete contract) and campaign results are counted separately; newer Foundry versions may group properties and
+report different totals.
