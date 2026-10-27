@@ -2,10 +2,10 @@
 
 Milestone-based escrow for freelance work, written in Solidity with Foundry and OpenZeppelin Contracts v5.
 
-> **Status:** Stage 4B (reputation registration and statistics) of a portfolio project. Stage 3 and the Stage 4A
-> design ([design](docs/stage-4-reputation-design.md), [test plan](docs/stage-4-test-plan.md)) are accepted;
-> soulbound receipts (slice 4C) are not implemented. Unaudited and intended for local development and testnets only.
-> Do not use it with real funds.
+> **Status:** Stage 4C (soulbound order receipts) of a portfolio project. Stage 3, the Stage 4A design
+> ([design](docs/stage-4-reputation-design.md), [test plan](docs/stage-4-test-plan.md)) and Stage 4B (registration
+> and statistics) are accepted. Unaudited and intended for local development and testnets only. Do not use it with
+> real funds.
 
 ## Architecture
 
@@ -15,7 +15,7 @@ Milestone-based escrow for freelance work, written in Solidity with Foundry and 
 | `WorkOrder`        | Holds one engagement's budget and releases it milestone by milestone; a disputed milestone ends the order with the court's ruling. |
 | `ArbitrationCourt` | Disputes opened by the factory's orders: candidate snapshot, panel draw, commit-reveal voting, rulings, fee and penalty credits. |
 | `ArbitratorRegistry` | Stake ledger and per-dispute candidate snapshots, deployed by and used only by the court. |
-| `TrustWorkReputation` | Optional, standalone: permissionless registration of final factory orders and factual per-account statistics. Nothing in the escrow, court or registry calls it. |
+| `TrustWorkReputation` | Optional, standalone: permissionless registration of final factory orders, factual per-account statistics, and optional nontransferable ERC-721/ERC-5192 receipts for the client and freelancer. Nothing in the escrow, court or registry calls it. |
 
 Each order is its own contract, so funds and state of different engagements never mix. There is no owner, admin,
 upgrade path, or pause switch. Escrowed tokens leave an order only through settlement (to the fee recipient and the
@@ -580,11 +580,12 @@ with `--isolate`, in both token configurations (target ≤ 2,000,000).
 
 ## Reputation
 
-`TrustWorkReputation(factory)` is slice 4B of the Stage 4 design
+`TrustWorkReputation(factory)` implements slices 4B and 4C of the Stage 4 design
 ([`docs/stage-4-reputation-design.md`](docs/stage-4-reputation-design.md)). It is bound to one immutable
-`TrustWorkFactory`, has no owner, setter, fee, pause, upgrade or rescue function, never moves tokens, and only makes
-view calls to the factory, the order and the factory's court. Deploying it, or not, changes nothing in escrow,
-arbitration or claims.
+`TrustWorkFactory`, has no owner, setter, fee, pause, upgrade, rescue, administrative mint or metadata function,
+never calls or moves any ERC-20 token, and only makes view calls to the factory, the order and the factory's court.
+The only token events it emits are its own ERC-721 receipt mints and burns. Deploying it, or not, changes nothing in
+escrow, arbitration or claims.
 
 **Registration.** `register(order)` can be called by anyone, once per order:
 
@@ -612,7 +613,7 @@ milestone counts, `totalAmount`, `settledAmount` (`directPaid`), `disputedAmount
 `fundedAt` and `lastSubmittedAt` (exact), and `closedNotBefore` (a lower bound of the closing time). It never reads
 payout credits, `claimsPaid`, `outstandingObligations` or balances, so registering before or after any claim yields
 the same facts. `records(order)` stores only the outcome and `registeredAt`, the registration time, which is not the
-closing time; `receiptsClaimed` is always `0` until receipts exist.
+closing time, and `receiptsClaimed`, one bit per role whose receipt was ever minted.
 
 **Statistics.** `statsOf(account, role)` returns, separately for the client and freelancer roles, `registered`, one
 counter per outcome and `milestonesSettled`. The fee-recipient position gives no statistics. No monetary amount is
@@ -626,12 +627,47 @@ toward orders someone wanted on record. Wash orders between addresses one person
 negligible amounts are possible and are not detected; every order's token, amounts and counterparty are exposed so
 consumers can filter. There is no Sybil resistance, identity or quality signal.
 
-**Gas** (`test/reputation/TrustWorkReputation.gas.t.sol`, storage cooled before the call, reported without a
-threshold): first registration for both accounts 284,560 (`Completed`), 287,169 (`DeliveryExpired`), 306,835
-(`FreelancerWins`), 307,196 (`Split`), 306,909 (`NoPanel`); 125,360 for `Completed` when both accounts already have a
-registration. With `--isolate`: 310,992, 313,601, 335,767, 336,128, 335,841 and 174,192.
+**Receipts.** The client and the freelancer of a registered order may each claim one receipt with
+`claimReceipt(order, role)`:
 
-Size: `TrustWorkReputation` runtime 7,207 B, initcode 7,448 B.
+- `NotRegistered` unless the order is registered; `NotRoleHolder` unless `msg.sender` is the order's client
+  (`Role.Client`) or freelancer (`Role.Freelancer`). There is no recipient parameter, so nobody can place a receipt
+  in someone else's wallet, and registration never mints. Claiming works for every registered outcome.
+- One receipt per `(order, role)` for the lifetime of the contract: the role's bit in `receiptsClaimed` is set before
+  the mint and never cleared, so a second claim reverts `ReceiptAlreadyClaimed`, also after the receipt was burned.
+- The token ID is `receiptId(order, role) = (uint256(uint160(order)) << 1) | uint256(role)`, computable before the
+  claim; `receiptOf(tokenId)` decodes it only for an existing receipt and reverts `ERC721NonexistentToken` for
+  never-minted, burned or high-bit IDs.
+- The mint uses `_mint`, so no `onERC721Received` callback is made: a contract wallet without `IERC721Receiver` can
+  hold a receipt and a hostile receiver cannot re-enter. A contract role holder that cannot initiate calls (for
+  example a contract client that can only drive the escrow) cannot claim. Events: `Transfer(0, holder, id)`,
+  `Locked(id)`, `ReceiptClaimed(order, role, holder, id)`.
+- The fee-recipient position grants no receipt. An address that is also the client or the freelancer keeps that
+  role's ordinary entitlement and nothing more.
+
+Receipts are soulbound (ERC-5192). An `_update` override allows only mint and burn: `transferFrom` and both
+`safeTransferFrom` overloads revert `ReceiptLocked(id)` for an existing receipt moved by its holder to a nonzero
+address, including to the holder itself; otherwise the standard `ERC721NonexistentToken`, `ERC721InvalidReceiver` or
+`ERC721InsufficientApproval` error comes first. `approve` and `setApprovalForAll` revert `ApprovalsDisabled`, so
+`getApproved` is always zero and `isApprovedForAll` always false. `locked(id)` is `true` for every existing receipt
+and reverts for nonexistent ones; `Unlocked` is never emitted. `supportsInterface` accepts ERC-165, ERC-721,
+ERC-721 Metadata and ERC-5192 (`0xb45a3c0e`). Name and symbol are `TrustWork Receipt` and `TWR`.
+
+Decisions: holders may `burn` their own receipts (U1), which emits the standard `Transfer(holder, 0, id)` and makes
+`ownerOf`, `locked`, `receiptOf` and `tokenURI` reject the ID; the record, facts, statistics and order lists stay,
+and the receipt can never be reissued. `tokenURI` returns an empty string for existing receipts (U2); the structured
+data is on-chain through `receiptOf` and `factsOf`. A wallet's receipts are a selection its holder chose to claim and
+keep; the counters are the less biased view.
+
+**Gas** (`test/reputation/TrustWorkReputation.gas.t.sol`, storage cooled before the call, reported without a
+threshold): first registration for both accounts 284,667 (`Completed`), 287,276 (`DeliveryExpired`), 306,942
+(`FreelancerWins`), 307,303 (`Split`), 307,016 (`NoPanel`); 125,467 for `Completed` when both accounts already have a
+registration. With `--isolate`: 311,099, 313,708, 335,874, 336,235, 335,948 and 174,299. `claimReceipt` 54,602
+(client's first receipt), 54,545 (freelancer's first), 34,702 (client already holds one); `burn` 10,124 in the same
+transaction as earlier writes to the same slots. With `--isolate`: 81,462, 81,417, 64,362; `burn` 32,368 (holder keeps
+another receipt) and 29,725 (last receipt).
+
+Size: `TrustWorkReputation` runtime 11,874 B, initcode 12,553 B.
 
 ## Development
 
@@ -659,8 +695,9 @@ and `test/invariant/TrustWorkIntegration*.sol`. Each runs twice, with one token 
 transfer during each protocol action, requires it to match the edges the test's own model expects for that
 transition, and keeps an independent per-contract ledger of liabilities and unsolicited balance. Reputation tests live in
 `test/reputation/` (unit, fuzz, gas; `MockReputationSources.sol` reaches the three consistency guards that the
-accepted contracts cannot trigger) and `test/invariant/TrustWorkReputation*.sol`, which runs the Stage 3E integration
-campaign with registrations interleaved, in both token configurations.
+accepted contracts cannot trigger; `TrustWorkReputation.receipts.t.sol` with `MockReceiptWallets.sol` covers receipts)
+and `test/invariant/TrustWorkReputation*.sol`, which runs the Stage 3E integration campaign with registrations,
+receipt claims, burns and rejected receipt operations interleaved, in both token configurations.
 `test/WorkOrder.delivery.t.sol` also contains a deterministic matrix of every funding path × reclaim at the first,
 middle and last milestone (9 cases); fuzz and invariant runs sample combinations rather than enumerating them. Mocks under `test/mocks/`
 are test-only: `MockUSDC` (6 decimals, open minting), `MockPermitUSDC` (adds ERC-2612), a fee-on-transfer token, a
@@ -688,8 +725,8 @@ Not implemented in this stage:
 - appeals, resubmission after a dispute, or more than one dispute per order;
 - cancellation by agreement, and any refund other than delivery-expiry reclaim;
 - recovery of unsolicited tokens sent directly to an order;
-- soulbound receipts (designed in [`docs/stage-4-reputation-design.md`](docs/stage-4-reputation-design.md), slice 4C,
-  not implemented), governance, frontend, deployment scripts, and a relayer service.
+- receipt metadata (`tokenURI` is empty; an on-chain JSON slice 4D is optional and not authorized), governance,
+  frontend, deployment scripts, and a relayer service.
 
 Stage 2 caveats:
 
@@ -718,6 +755,12 @@ Stage 3E caveats:
 Stage 4B caveats:
 
 - Registered history is incomplete and voluntarily selected; counters are not statistics over all orders.
+
+Stage 4C caveats:
+
+- Receipts are claimed and burned at will, so a wallet's receipts are a curated selection.
+- A contract client or freelancer that cannot initiate calls can never claim its receipt.
+- Wallets show receipts without a name, description or image, because `tokenURI` is empty.
 - The closing time is not on-chain state; only `closedNotBefore` and `registeredAt` bound it.
 - Orders left `Active` or `Disputed` forever never become eligible.
 

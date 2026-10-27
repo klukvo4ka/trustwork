@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {WorkOrder} from "../../src/WorkOrder.sol";
 import {ITrustWorkReputation} from "../../src/interfaces/ITrustWorkReputation.sol";
@@ -47,6 +48,65 @@ abstract contract TrustWorkReputationFuzzTest is ReputationTestBase {
         (, uint64 registeredAt,) = reputation.records(address(s.order));
         assertEq(registeredAt, block.timestamp);
         assertEq(_registrationHash(address(s.order)), expected);
+    }
+
+    /// @dev RF-03: distinct (address, role) pairs give distinct IDs, including the address boundaries, and no such ID
+    /// exists before it is claimed.
+    function testFuzz_ReceiptIdInjective(address a, address b, uint8 roleA, uint8 roleB) public {
+        ITrustWorkReputation.Role ra = ITrustWorkReputation.Role(roleA % 2);
+        ITrustWorkReputation.Role rb = ITrustWorkReputation.Role(roleB % 2);
+        uint256 idA = reputation.receiptId(a, ra);
+        assertEq(idA >> 1, uint256(uint160(a)));
+        assertEq(idA & 1, uint256(ra));
+        if (a != b || ra != rb) assertTrue(idA != reputation.receiptId(b, rb));
+
+        address[4] memory bounds = [address(0), address(1), address(type(uint160).max - 1), address(type(uint160).max)];
+        uint256[8] memory ids;
+        for (uint256 i; i < 8; ++i) {
+            ids[i] = reputation.receiptId(bounds[i / 2], ITrustWorkReputation.Role(i % 2));
+            for (uint256 j; j < i; ++j) {
+                assertTrue(ids[i] != ids[j]);
+            }
+            vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, ids[i]));
+            reputation.receiptOf(ids[i]);
+        }
+        assertEq(ids[7], (uint256(type(uint160).max) << 1) | 1);
+        assertEq(ids[7] >> 161, 0);
+    }
+
+    /// @dev RF-04: every minted receipt decodes to its own order and role, and stops decoding once burned.
+    function testFuzz_MintedReceiptRoundTrip(uint256 pathSeed, uint256 roleMask, bool burnFirst) public {
+        Scenario memory s = _sampled(_defaultAmounts(), FEE_BPS, pathSeed % 7, 1);
+        reputation.register(address(s.order));
+        uint256 mask = bound(roleMask, 1, 3);
+        address[2] memory holders = [client, freelancer];
+        uint256[2] memory ids;
+        for (uint256 r; r < 2; ++r) {
+            if ((mask >> r) & 1 == 0) continue;
+            ITrustWorkReputation.Role role = ITrustWorkReputation.Role(r);
+            vm.prank(holders[r]);
+            ids[r] = reputation.claimReceipt(address(s.order), role);
+            (address order, ITrustWorkReputation.Role decoded) = reputation.receiptOf(ids[r]);
+            assertEq(order, address(s.order));
+            assertEq(uint256(decoded), r);
+            assertEq(reputation.receiptId(order, decoded), ids[r]);
+            assertEq(reputation.ownerOf(ids[r]), holders[r]);
+        }
+        (,, uint8 receiptsClaimed) = reputation.records(address(s.order));
+        assertEq(receiptsClaimed, mask);
+
+        uint256 burned = mask == 3 ? (burnFirst ? 0 : 1) : mask - 1;
+        vm.prank(holders[burned]);
+        reputation.burn(ids[burned]);
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, ids[burned]));
+        reputation.receiptOf(ids[burned]);
+        (,, receiptsClaimed) = reputation.records(address(s.order));
+        assertEq(receiptsClaimed, mask);
+        if (mask == 3) {
+            (address order, ITrustWorkReputation.Role decoded) = reputation.receiptOf(ids[1 - burned]);
+            assertEq(order, address(s.order));
+            assertEq(uint256(decoded), 1 - burned);
+        }
     }
 
     /// @dev Path 0 Completed, 1 delivery expiry, 2–6 rulings `Outcome(path - 2)`. Expiry uses position 1 or 2.

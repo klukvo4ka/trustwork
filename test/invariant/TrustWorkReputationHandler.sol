@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {TrustWorkFactory} from "../../src/TrustWorkFactory.sol";
 import {TrustWorkReputation} from "../../src/TrustWorkReputation.sol";
 import {WorkOrder} from "../../src/WorkOrder.sol";
@@ -9,8 +10,9 @@ import {MockPermitUSDC} from "../mocks/MockPermitUSDC.sol";
 import {TransferLedger} from "../utils/TransferLedger.sol";
 import {TrustWorkIntegrationHandler} from "./TrustWorkIntegrationHandler.sol";
 
-/// @dev Adds registration to the Stage 3E integration handler. Expected outcomes come from the parent's ghosts
-/// (settlement counts, dispute IDs, panel votes), never from the reputation contract.
+/// @dev Adds registration and receipts to the Stage 3E integration handler. Expected outcomes come from the parent's
+/// ghosts (settlement counts, dispute IDs, panel votes) and expected receipt state from this handler's own ghosts, never
+/// from the reputation contract.
 contract TrustWorkReputationHandler is TrustWorkIntegrationHandler {
     TrustWorkReputation public immutable reputation;
 
@@ -25,6 +27,21 @@ contract TrustWorkReputationHandler is TrustWorkIntegrationHandler {
     uint256 public rejectedNoParticipation;
     uint256 public rejectedDuplicate;
     uint256 public rejectedUnknown;
+
+    mapping(WorkOrder order => mapping(ITrustWorkReputation.Role role => uint256)) public ghostMints;
+    mapping(WorkOrder order => uint8) public ghostClaimBits;
+    mapping(uint256 tokenId => address) public ghostOwner;
+    mapping(address account => uint256) public ghostBalance;
+    uint256[] public mintedIds;
+
+    uint256[2] internal _claimsByRole;
+    uint256 public burns;
+    uint256 public rejectedDuplicateClaims;
+    uint256 public rejectedClaimsAfterBurn;
+    uint256 public rejectedUnregisteredClaims;
+    uint256 public rejectedUnauthorized;
+    uint256 public rejectedTransfers;
+    uint256 public rejectedApprovals;
 
     constructor(
         TrustWorkFactory factory_,
@@ -64,6 +81,78 @@ contract TrustWorkReputationHandler is TrustWorkIntegrationHandler {
         }
     }
 
+    /// @dev Mostly registered orders, sometimes any order; the caller is the role holder or another known address.
+    function claimReceipt(uint256 orderSeed, uint256 roleSeed, uint256 callerSeed) external {
+        WorkOrder order = (orderSeed >> 128) % 4 != 0 && registeredOrders.length != 0
+            ? registeredOrders[orderSeed % registeredOrders.length]
+            : _order(orderSeed);
+        if (address(order) == address(0)) return;
+        ITrustWorkReputation.Role role = ITrustWorkReputation.Role(roleSeed % 2);
+        _claim(order, role, callerSeed % 2 == 0 ? _holder(role) : _otherCaller(order, callerSeed >> 1));
+    }
+
+    function burnReceipt(uint256 idSeed, uint256 callerSeed) external {
+        if (mintedIds.length == 0) return;
+        uint256 tokenId = mintedIds[idSeed % mintedIds.length];
+        address owner = ghostOwner[tokenId];
+        address caller = callerSeed % 2 == 0 && owner != address(0) ? owner : _anyCaller(callerSeed >> 1);
+        if (owner == address(0)) {
+            vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, tokenId));
+            ++rejectedUnauthorized;
+        } else if (caller != owner) {
+            vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, caller, tokenId));
+            ++rejectedUnauthorized;
+        } else {
+            ghostOwner[tokenId] = address(0);
+            --ghostBalance[owner];
+            ++burns;
+        }
+        vm.prank(caller);
+        reputation.burn(tokenId);
+    }
+
+    /// @dev The owner of a live receipt tries one of the three transfer entry points or an approval.
+    function moveReceipt(uint256 idSeed, uint256 modeSeed, uint256 recipientSeed) external {
+        if (mintedIds.length == 0) return;
+        uint256 tokenId = mintedIds[idSeed % mintedIds.length];
+        address owner = ghostOwner[tokenId];
+        if (owner == address(0)) return;
+        address to = recipientSeed % 4 == 0 ? owner : _anyCaller(recipientSeed >> 2);
+        uint256 mode = modeSeed % 5;
+        if (mode < 3) {
+            vm.expectRevert(abi.encodeWithSelector(ITrustWorkReputation.ReceiptLocked.selector, tokenId));
+            ++rejectedTransfers;
+        } else {
+            vm.expectRevert(ITrustWorkReputation.ApprovalsDisabled.selector);
+            ++rejectedApprovals;
+        }
+        vm.prank(owner);
+        if (mode == 0) reputation.transferFrom(owner, to, tokenId);
+        else if (mode == 1) reputation.safeTransferFrom(owner, to, tokenId);
+        else if (mode == 2) reputation.safeTransferFrom(owner, to, tokenId, "");
+        else if (mode == 3) reputation.approve(to, tokenId);
+        else reputation.setApprovalForAll(to, true);
+    }
+
+    /// @dev Both role holders claim every unclaimed receipt of every registered order.
+    function claimAll() external {
+        for (uint256 i; i < registeredOrders.length; ++i) {
+            WorkOrder order = registeredOrders[i];
+            for (uint256 r; r < 2; ++r) {
+                ITrustWorkReputation.Role role = ITrustWorkReputation.Role(r);
+                if (ghostMints[order][role] == 0) _claim(order, role, _holder(role));
+            }
+        }
+    }
+
+    function mintedCount() external view returns (uint256) {
+        return mintedIds.length;
+    }
+
+    function claimsByRole(ITrustWorkReputation.Role role) external view returns (uint256) {
+        return _claimsByRole[uint256(role)];
+    }
+
     function registeredCount() external view returns (uint256) {
         return registeredOrders.length;
     }
@@ -98,6 +187,56 @@ contract TrustWorkReputationHandler is TrustWorkIntegrationHandler {
             _recordGhost(order, expected);
         }
         assertEq(_escrowState(order), before, "registration changed escrow, court or registry state");
+    }
+
+    function _claim(WorkOrder order, ITrustWorkReputation.Role role, address caller) internal {
+        bytes32 before = _escrowState(order);
+        uint8 bit = uint8(1) << uint8(role);
+        uint256 tokenId = (uint256(uint160(address(order))) << 1) | uint256(role);
+        if (ghostOutcome[order] == ITrustWorkReputation.Outcome.None) {
+            vm.expectRevert(abi.encodeWithSelector(ITrustWorkReputation.NotRegistered.selector, address(order)));
+            ++rejectedUnregisteredClaims;
+        } else if (caller != _holder(role)) {
+            vm.expectRevert(
+                abi.encodeWithSelector(ITrustWorkReputation.NotRoleHolder.selector, address(order), role, caller)
+            );
+            ++rejectedUnauthorized;
+        } else if (ghostClaimBits[order] & bit != 0) {
+            vm.expectRevert(
+                abi.encodeWithSelector(ITrustWorkReputation.ReceiptAlreadyClaimed.selector, address(order), role)
+            );
+            if (ghostOwner[tokenId] == address(0)) ++rejectedClaimsAfterBurn;
+            else ++rejectedDuplicateClaims;
+        } else {
+            ghostClaimBits[order] |= bit;
+            ++ghostMints[order][role];
+            ghostOwner[tokenId] = caller;
+            ++ghostBalance[caller];
+            mintedIds.push(tokenId);
+            ++_claimsByRole[uint256(role)];
+            vm.prank(caller);
+            assertEq(reputation.claimReceipt(address(order), role), tokenId);
+            assertEq(_escrowState(order), before, "claim changed escrow, court or registry state");
+            return;
+        }
+        vm.prank(caller);
+        reputation.claimReceipt(address(order), role);
+        assertEq(_escrowState(order), before, "rejected claim changed escrow, court or registry state");
+    }
+
+    function _holder(ITrustWorkReputation.Role role) internal view returns (address) {
+        return role == ITrustWorkReputation.Role.Client ? client : freelancer;
+    }
+
+    /// @dev May coincide with the role holder when the order's fee recipient is the client.
+    function _otherCaller(WorkOrder order, uint256 seed) internal view returns (address) {
+        if (seed % 6 == 5) return order.feeRecipient();
+        return _anyCaller(seed);
+    }
+
+    function _anyCaller(uint256 seed) internal view returns (address) {
+        address[5] memory callers = [client, freelancer, feeRecipient, actors[0], donor];
+        return callers[seed % 5];
     }
 
     function _expectedOutcome(WorkOrder order, WorkOrder.OrderStatus status)

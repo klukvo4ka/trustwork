@@ -1,8 +1,8 @@
 # Stage 4 — Test plan
 
 Status: test plan for [stage-4-reputation-design.md](stage-4-reputation-design.md), with the Stage 4B clarifications.
-The 4B cases of section 11 are implemented under `test/reputation/` and `test/invariant/TrustWorkReputation*.sol`;
-the 4C receipt cases are not implemented.
+The 4B cases (accepted, `1cb0e3f`, section 12) and the 4C cases (section 13) of section 11 are implemented under
+`test/reputation/` and `test/invariant/TrustWorkReputation*.sol`.
 
 ## 1. Conventions
 
@@ -156,8 +156,8 @@ the 4C receipt cases are not implemented.
 | --- | --- |
 | RI-01 | For every account and role, the outcome counters sum to `registered`, and `registered == orderCount(account, role)` |
 | RI-02 | Every registered order is a factory order, was final and had a first milestone that was not `Pending` at registration; its outcome equals the handler's ghost |
-| RI-03 | `outcome`, `registeredAt` and `factsOf` of a registered order never change afterwards; `receiptsClaimed` stays `0` in 4B and in 4C only gains bits |
-| RI-04 | Every existing receipt is locked and owned by its role holder; receipts are never transferred (ghost of `Transfer` events: only mints and burns) |
+| RI-03 | `outcome`, `registeredAt` and `factsOf` of a registered order never change afterwards; `receiptsClaimed` stays `0` in 4B and in 4C equals the bits of the receipts ever minted, kept after burn |
+| RI-04 | Every existing receipt is locked, decodes to its pair and is owned by its role holder; burned receipts have no owner; `balanceOf` of every account equals the ghost built from mints and burns only |
 | RI-05 | At most one mint per `(order, role)` over the whole campaign, burned or not |
 | RI-06 | The Stage 3E integration invariants II-01…II-08 hold unchanged with reputation actions interleaved |
 
@@ -235,3 +235,46 @@ campaign makes 16,384 handler calls, and Foundry 1.5.1 prints one line per decla
 campaign's call and revert counts. Declared properties (functions), concrete property executions (a property in each
 concrete contract) and campaign results are counted separately; newer Foundry versions may group properties and
 report different totals.
+
+## 13. 4C implementation map
+
+Every case runs in `SharedToken` and `SplitToken`. Receipt unit cases live in
+`test/reputation/TrustWorkReputation.receipts.t.sol`; contract holders use `test/mocks/MockExecutingWallet.sol` and
+`test/mocks/MockReceiptWallets.sol`, which act only through their own methods.
+
+| Cases | Test |
+| --- | --- |
+| RR-01, RR-05, RR-06 | `test_Claim_BothRolesForEveryOutcome` (seven scenarios: `Completed`, `DeliveryExpired`, `FreelancerWins`, `ClientWins`, `Split` by tie and by zero reveals, `NoPanel`; exact three-log order, no `Unlocked`) |
+| RG-05 | `test_RevertWhen_ClaimedByNonHolder` (each role against the other party, fee recipient and a stranger; a fee recipient equal to the client or the freelancer gets that role's receipt only) |
+| RR-02, RR-03 | `test_RevertWhen_ClaimedTwiceBeforeOrAfterBurn` |
+| RR-04 | `test_ReceiptIds_DistinctAcrossOrders` |
+| RR-07 | `test_RevertWhen_ClaimUnregisteredOrDecodeNonexistent` (includes an ID with high bits above an existing receipt) |
+| RT-01, RT-02 | `test_RevertWhen_TransferAttempted` (all three entry points, exact revert data; holder to another address and to itself, zero recipient, third party, unminted and burned IDs) |
+| RT-03 | `test_RevertWhen_ApprovalAttempted` |
+| RT-04, RT-05 | `test_Burn_HolderOnlyAndPermanent` |
+| RC-01…RC-04 | `test_Interfaces_MetadataAndLockStatus` |
+| RW-01 | `test_ContractWalletWithoutReceiver_ClaimsReceipt` |
+| RW-02 | `test_ReceiverCallbackNeverCalled` (reverting and re-entering `onERC721Received`; `receiverCalls == 0`) |
+| RW-03 | `test_EscrowOnlyContractClient_CannotBeClaimedFor` |
+| RU-01 (receipt part) | `test_Receipts_LeaveEscrowCourtAndRegistryUnchanged` (no payment- or stake-token log; escrow, court and registry hash unchanged) |
+| RU-03 (receipt part) | `test_Receipts_DoNotAffectFinancialClaims` |
+| RF-03 | `TrustWorkReputation.fuzz.t.sol`: `testFuzz_ReceiptIdInjective` (sampled pairs, plus `address(0)`, `address(1)`, `type(uint160).max - 1` and `type(uint160).max` with both roles) |
+| RF-04 | `testFuzz_MintedReceiptRoundTrip` |
+| RI-03 (updated) | `invariant_RecordsAndFactsNeverChange` (claim bits equal the handler's ghost) |
+| RI-04 | `invariant_LiveReceiptsLockedWithRoleHolder` |
+| RI-05 | `invariant_AtMostOneReceiptPerOrderRole` (lifetime mints per pair at most 1, bit set exactly when minted, only for registered orders, IDs never repeated) |
+| RI-06 | the inherited II-01…II-08 |
+
+The reputation handler adds `claimReceipt` (registered or any order; role holder or another known address),
+`burnReceipt` (holder or another address, live or burned ID), `moveReceipt` (the holder tries one of the three
+transfer entry points or an approval) and `claimAll`. Its ghosts for lifetime mints, live owners, balances and claim
+bits are written only from the handler's own expectations. Every claim attempt asserts that order, court and registry
+state are unchanged. Fuzzing targets three `claimReceipt`, one `burnReceipt` and one `moveReceipt` selector in
+addition to the 4B targets, and `afterInvariant` claims every remaining receipt before the final check.
+
+`test_RandomCampaignsExerciseReceipts` replays 32 fixed campaigns of 128 calls with registrations and receipt
+operations interleaved, then settles everything, registers every final order, runs 32 receipt operations on them,
+and claims everything; it checks all invariants after every call. It requires client claims, freelancer claims,
+burns, rejected duplicate claims, rejected claims after burn, unauthorized claims and burns, rejected transfers and
+rejected approvals. The 4B replay `test_RandomCampaignsRegisterEveryOutcome` and the Stage 3E replay keep their call
+mixes. `TrustWorkReputation.gas.t.sol` also reports `claimReceipt` and `burn` gas without a threshold.
