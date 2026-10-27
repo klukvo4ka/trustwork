@@ -1,7 +1,9 @@
 # Stage 4 — Reputation and soulbound receipts design
 
-Status: Stage 4A design proposal, for review. Nothing in this document is implemented. Interfaces and pseudocode
-below are design material for Stage 4B and later slices.
+Status: Stage 4A design (accepted with the clarifications of Stage 4B). Slice 4B — registration, facts and
+statistics — is implemented in `src/TrustWorkReputation.sol` and `src/interfaces/ITrustWorkReputation.sol`.
+Receipts (sections 6.2 and 6.3, slice 4C) are **not implemented**; their interfaces and pseudocode remain design
+material.
 Baseline: Stage 3E, commit `8c5549772b6561f0118644d8a71ee23d9e6cf205` (escrow, arbitration and production
 integration accepted).
 
@@ -80,11 +82,16 @@ TrustWorkFactory (accepted, immutable) <--isWorkOrder, court--- TrustWorkReputat
 - `TrustWorkReputation(TrustWorkFactory factory_)`: rejects a zero address (`ZeroFactory`) or an address without code
   (`FactoryHasNoCode`). `factory` is immutable. No owner, setter, pause, upgrade, fee, oracle or rescue function.
 - It is deployed after the factory and is optional: escrow works the same with or without it.
-- It makes only `view` calls (compiled to `STATICCALL`) to the factory, genuine orders and the factory's court, so
-  those calls cannot change state or re-enter it.
+- It makes only `view` calls (compiled to `STATICCALL`) to the factory, genuine orders and the factory's court.
+  `STATICCALL` prevents the callee, and anything it calls, from changing state; it does not prevent a callee from
+  reading this contract's views during the call. Registration writes its state only after its last external call,
+  so such a read sees the order as unregistered, which is accurate at that point.
 - **Assumption R1.** The factory, its orders and its court are the accepted Stage 3 bytecode. Authentication relies
   on `factory.isWorkOrder(order)`; an order's own `court()` must equal `factory.court()`, which is always true for
-  factory orders and is checked as a consistency guard.
+  factory orders and is checked as a consistency guard (`CourtMismatch`). The court's dispute record must name this
+  order and its current milestone (`InconsistentDispute`), and the ruling and reason must be one of the four pairs
+  the court can produce (`UnsupportedRuling`). These guards cannot fail with the accepted contracts; tests reach them
+  with mocks.
 
 **Tradeoff (standalone contract).** Recording inside `WorkOrder` would give complete history, but it would change
 accepted money-handling code and make reputation a dependency of settlement. A standalone recorder cannot force
@@ -96,10 +103,15 @@ registration, so history is incomplete (section 7).
 deployed `WorkOrder` contracts and arbitrary contracts are rejected with `UnknownOrder(order)` before any other call
 is made to them.
 
-**Participation evidence.** `milestone[0].submittedAt != 0`. Only the freelancer can submit, and milestones are
-sequential, so this holds exactly when the freelancer submitted at least once. Every completion and every dispute
-implies it (both require a submitted milestone); a delivery expiry satisfies it only if an earlier milestone was
-submitted and settled (`currentMilestone > 0`).
+**Participation evidence.** `milestone[0].status != Pending`. Only the freelancer can move a milestone out of
+`Pending` (by submitting it), and milestones are sequential, so the first milestone's status is `Submitted`, `Settled`
+or `Disputed` exactly when the freelancer submitted at least once. For an eligible terminal order it is `Settled`
+(completion, or a dispute or expiry at a later milestone) or `Disputed` (a dispute at the first milestone). A delivery
+expiry satisfies it only if an earlier milestone was submitted and settled (`currentMilestone > 0`).
+
+The status is used rather than `submittedAt != 0` because a submission in a block with timestamp `0` would store
+`submittedAt == 0`; the status cannot be confused that way. `submittedAt` is still reported as a fact
+(`lastSubmittedAt`).
 
 Let `k = currentMilestone`, `D = amount[k]` (dispute or expiry milestone), `S = directPaid`,
 `R = totalAmount - S - D` (later milestones), `fee(x) = order.feeFor(x)`.
@@ -111,7 +123,7 @@ Let `k = currentMilestone`, `D = amount[k]` (dispute or expiry milestone), `S = 
 | `Disputed`, court not resolved | no (`OrderNotFinal`) | — | — | — | none |
 | `Disputed`, court resolved, `applyRuling` not called | no (`OrderNotFinal`); anyone may call `applyRuling` first | — | — | — | none |
 | `Completed` | yes (participation always holds) | `Completed` | `settledMilestones = milestoneCount`, `settledAmount = totalAmount`, `freelancerAwarded = totalAmount`, `clientReturned = 0` | client and freelancer may claim | `registered`, `completed`, `milestonesSettled += count` for both |
-| `Terminated`, `disputeId == 0`, `k == 0` (no submission) | **no** (`NoParticipation`) | — | — | — | none |
+| `Terminated`, `disputeId == 0`, `k == 0` (first milestone still `Pending`) | **no** (`NoParticipation`) | — | — | — | none |
 | `Terminated`, `disputeId == 0`, `k > 0` | yes | `DeliveryExpired` | `settledMilestones = k`, `settledAmount = S`, `freelancerAwarded = S`, `clientReturned = totalAmount - S` | both may claim | `registered`, `deliveryExpired`, `milestonesSettled += k` for both |
 | `Terminated`, ruling `FreelancerWins` / `Majority` | yes | `FreelancerWins` | `settledMilestones = k`, `disputedAmount = D`, `freelancerAwarded = S + D`, `clientReturned = R` | both may claim | `registered`, `freelancerWins`, `milestonesSettled += k` for both |
 | `Terminated`, ruling `ClientWins` / `Majority` | yes | `ClientWins` | `freelancerAwarded = S`, `clientReturned = D + R` | both may claim | `registered`, `clientWins`, `milestonesSettled += k` for both |
@@ -126,11 +138,19 @@ Rules:
   released by timeout without the client's approval, and the contracts do not say which.
 - Amounts are gross order amounts in the order's token, before the protocol fee; the fee recipient's share is not
   attributed to anyone.
-- A terminated order with `disputeId != 0` takes its outcome from `court.rulingOf(disputeId)`; the implementation also
-  checks `court.getDispute(disputeId).order == order` and `milestoneIndex == k`. A `Terminated` order with
+- A terminated order with `disputeId != 0` takes its ruling and reason from `court.getDispute(disputeId)` (the same
+  values `rulingOf` returns); the implementation checks that the dispute's `order` is this order and its
+  `milestoneIndex == k` (`InconsistentDispute`) and accepts only `FreelancerWins/Majority`, `ClientWins/Majority`,
+  `Split/NoDecision` and `FreelancerWins/NoPanel` (`UnsupportedRuling` otherwise). A `Terminated` order with
   `disputeId == 0` was terminated by delivery expiry: no other accepted path reaches `Terminated` without a dispute.
-- **Claim independence.** The classification and every recorded field use only the final fields of section 2, so
-  registering before, between or after any `claimPayout` or `claimReward` yields an identical record (test RE-13).
+- A `Completed` order has `currentMilestone == milestoneCount`; that path never reads `getMilestone(currentMilestone)`
+  and takes `lastSubmittedAt` from the last milestone. A delivery expiry reads milestones `k` and `k - 1` (`k > 0` is
+  guaranteed by the participation rule). Registration and `factsOf` read at most three milestones and never iterate
+  over milestones or registered orders.
+- **Claim independence.** The classification and every business fact use only the final fields of section 2, so
+  registering before, between or after any `claimPayout` or `claimReward` yields the same outcome, facts, counters and
+  order lists (test RE-13). `registeredAt` is the registration block's timestamp and naturally differs when
+  registration happens at a different time; complete records are equal only when registration time is the same.
 
 ## 5. Stored data and metrics
 
@@ -144,10 +164,14 @@ enum Outcome { None, Completed, DeliveryExpired, FreelancerWins, ClientWins, Spl
 struct OrderRecord {
     Outcome outcome;
     uint64 registeredAt;        // block.timestamp of registration; not the closing time
-    uint8 receiptsClaimed;      // bit 0: client receipt minted, bit 1: freelancer receipt minted
+    uint8 receiptsClaimed;      // bit 0: client receipt minted, bit 1: freelancer receipt minted (slice 4C)
 }
 mapping(address order => OrderRecord) public records;
 ```
+
+`outcome` and `registeredAt` are immutable after registration. Facts, counters and order lists never change through
+receipt operations. `receiptsClaimed` is the only mutable part of a record: in slice 4C it gains a bit on the first
+successful claim of each role and never clears, including on burn. In 4B no receipt exists and it is always `0`.
 
 The remaining facts are final order and court state (section 2). They are returned by a view that recomputes
 them, so they need no copy:
@@ -184,6 +208,9 @@ which itself fits in `uint256`, so no per-order arithmetic can overflow; `floor(
 every call, and registration stores one slot per order instead of about ten. Test RE-13 checks that `factsOf` is
 unchanged by later claims.
 
+Timestamps are converted with checked `SafeCast.toUint64`: `fundedAt = milestone[0].deliveryDeadline -
+deliveryPeriod` (checked subtraction), `registeredAt = block.timestamp`.
+
 ### 5.2 Per-account counters
 
 ```solidity
@@ -199,8 +226,9 @@ struct Stats {
     uint256 noPanel;
     uint256 milestonesSettled;
 }
-mapping(address account => mapping(Role role => Stats)) public statsOf;
+mapping(address account => mapping(Role role => Stats)) private _stats;          // read through statsOf
 mapping(address account => mapping(Role role => address[])) private _orders;   // append-only, paged view
+function statsOf(address account, Role role) external view returns (Stats memory);
 ```
 
 | Counter | Source | Update at registration | Meaning |
@@ -217,8 +245,10 @@ The outcome counters partition `registered`:
 `completed + deliveryExpired + freelancerWins + clientWins + splits + noPanel == registered`.
 
 `_orders[account][role]` lists the registered orders in registration order, with
-`ordersOf(account, role, offset, limit)` and `orderCount(account, role)`. With it, a consumer can recompute any
-statistic restricted to tokens, counterparties or amounts it trusts.
+`ordersOf(account, role, offset, limit)` and `orderCount(account, role)`. `ordersOf` returns an empty array when
+`limit == 0` or `offset >= length`, and otherwise `min(limit, length - offset)` entries starting at `offset`; it never
+computes `offset + limit`, so `type(uint256).max` inputs cannot overflow. With these lists a consumer can recompute
+any statistic restricted to tokens, counterparties or amounts it trusts.
 
 **Numeric safety.** Counters only count. Each registration adds 1, or `settledMilestones`, which is at most the
 order's milestone array length; reaching `2^256` would need more orders or milestones than can ever be created, so
@@ -271,7 +301,7 @@ address (Stage 1 rule), so one order never changes both roles of one account.
 ## 6. Registration and receipts API
 
 ```solidity
-interface ITrustWorkReputation /* proposed */ {
+interface ITrustWorkReputation /* full design; 4B implements only the registration, facts and statistics members */ {
     event OrderRegistered(address indexed order, Outcome outcome, address indexed client, address indexed freelancer);
     event ReceiptClaimed(address indexed order, Role role, address indexed holder, uint256 tokenId);
 
@@ -280,7 +310,9 @@ interface ITrustWorkReputation /* proposed */ {
     error UnknownOrder(address order);
     error OrderNotFinal(address order, WorkOrder.OrderStatus status);
     error NoParticipation(address order);
+    error CourtMismatch(address order, address orderCourt);
     error InconsistentDispute(address order, uint256 disputeId);
+    error UnsupportedRuling(address order, IArbitrationCourt.Ruling ruling, IArbitrationCourt.RulingReason reason);
     error AlreadyRegistered(address order);
     error NotRegistered(address order);
     error NotRoleHolder(address order, Role role, address caller);
@@ -306,16 +338,20 @@ interface ITrustWorkReputation /* proposed */ {
 `factsOf` and `claimReceipt` revert `NotRegistered` for an order that has not been registered; `receiptOf` reverts
 `ERC721NonexistentToken` for an ID that is not currently minted.
 
+**Implemented in 4B:** `factory`, `register`, `records`, `factsOf`, `statsOf`, `orderCount`, `ordersOf`,
+`OrderRegistered` and the errors up to `NotRegistered`. **Not implemented (4C):** `claimReceipt`, `burn`,
+`receiptId`, `receiptOf`, `ReceiptClaimed` and the receipt errors.
+
 ### 6.1 `register(order)`
 
 ```
-require factory.isWorkOrder(order)                      else UnknownOrder
+require factory.isWorkOrder(order)                      else UnknownOrder        (before any call to order)
 require records[order].outcome == None                  else AlreadyRegistered
-require order.court() == factory.court()                (consistency guard)
+require order.court() == factory.court()                else CourtMismatch
 status = order.status()
 require status == Completed or status == Terminated     else OrderNotFinal
-require order.getMilestone(0).submittedAt != 0          else NoParticipation
-outcome = classify(order)                               (section 4; reads court for disputeId != 0)
+require order.getMilestone(0).status != Pending         else NoParticipation
+outcome = classify(order)                               (section 4; InconsistentDispute, UnsupportedRuling)
 records[order] = (outcome, block.timestamp, 0)
 statsOf[client][Client] += outcome; statsOf[freelancer][Freelancer] += outcome
 _orders[client][Client].push(order); _orders[freelancer][Freelancer].push(order)
@@ -366,7 +402,7 @@ interface IERC5192 {
 | `supportsInterface` | `true` for ERC-165 (`0x01ffc9a7`), ERC-721 (`0x80ac58cd`), ERC-721 Metadata (`0x5b5e139f`) and ERC-5192 (`0xb45a3c0e`); `false` for `0xffffffff` and others |
 | `locked(tokenId)` | `true` for every existing receipt; reverts `ERC721NonexistentToken` for a nonexistent or burned token (ERC-5192: queries about tokens assigned to the zero address throw) |
 | `Locked` event | emitted once at mint, after `Transfer(0, holder, id)`; `Unlocked` is never emitted |
-| `transferFrom`, both `safeTransferFrom` | revert `ReceiptLocked(tokenId)` through an `_update` override that allows only mint (`from == 0`) and burn (`to == 0`) |
+| `transferFrom`, both `safeTransferFrom` | revert `ReceiptLocked(tokenId)` through an `_update` override that allows only mint (`from == 0`) and burn (`to == 0`). The exact `ReceiptLocked` error applies to an existing token, an authorized holder and a nonzero recipient; the standard `ERC721NonexistentToken`, `ERC721InvalidReceiver` and authorization errors may come first otherwise |
 | `approve`, `setApprovalForAll` | revert `ApprovalsDisabled`; `getApproved` returns `address(0)` for existing tokens and reverts for nonexistent ones; `isApprovedForAll` returns `false` |
 | `burn(tokenId)` | holder only (`msg.sender == ownerOf(tokenId)`), no approved operators; emits `Transfer(holder, 0, id)`; records, counters and `receiptsClaimed` are unchanged |
 | `balanceOf`, `ownerOf` | standard ERC-721 |
@@ -445,7 +481,7 @@ are a curated selection; the counters are the less biased view.
 
 | Slice | Content | Acceptance |
 | --- | --- | --- |
-| 4B | `TrustWorkReputation` registration: factory binding, eligibility, participation rule, classification, `factsOf`, records, counters, order lists, events and errors; no ERC-721 | the 4B cases of test plan §11 pass, (2×) cases in both token configurations; escrow, court and registry counters and balances unchanged by registration; 100% line and branch coverage of the new contract; `forge fmt --check`, `forge build`, `forge test`, `forge coverage` reported |
+| 4B (implemented) | `TrustWorkReputation` registration: factory binding, eligibility, participation rule, classification, `factsOf`, records, counters, order lists, events and errors; no ERC-721 | the 4B cases of test plan §11 pass, (2×) cases in both token configurations; escrow, court and registry counters and balances unchanged by registration; 100% line and branch coverage of the new contract; `forge fmt --check`, `forge build`, `forge test`, `forge coverage` reported |
 | 4C | Receipts: ERC-721 base, ERC-5192 `locked` and `Locked`, `claimReceipt`, deterministic IDs, `_update` lock, disabled approvals, holder burn, `supportsInterface`, empty `tokenURI` | the 4C cases of test plan §11 pass; no receipt operation can affect order or court state; runtime below 24,576 B; same command reporting |
 | 4D (optional) | On-chain JSON `tokenURI` (decision U2) | only if authorized after 4C review |
 

@@ -14,11 +14,9 @@ import {TrustWorkIntegrationHandler} from "./TrustWorkIntegrationHandler.sol";
 abstract contract TrustWorkIntegrationInvariantTest is StdInvariant, IntegrationTestBase {
     TrustWorkIntegrationHandler internal handler;
 
-    function setUp() public override {
+    function setUp() public virtual override {
         super.setUp();
-        handler = new TrustWorkIntegrationHandler(
-            factory, paymentToken, stakeToken, ledger, client, clientKey, freelancer, feeRecipient
-        );
+        handler = _deployHandler();
         for (uint256 i; i < handler.ACTOR_COUNT(); ++i) {
             handler.deposit(i, 3 * SEAT_LOCK);
         }
@@ -26,7 +24,19 @@ abstract contract TrustWorkIntegrationInvariantTest is StdInvariant, Integration
         handler.createOrder(1, 0);
         handler.createOrder(2, 1);
 
-        bytes4[] memory selectors = new bytes4[](31);
+        bytes4[] memory selectors = _targetSelectors();
+        targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
+        targetContract(address(handler));
+    }
+
+    function _deployHandler() internal virtual returns (TrustWorkIntegrationHandler) {
+        return new TrustWorkIntegrationHandler(
+            factory, paymentToken, stakeToken, ledger, client, clientKey, freelancer, feeRecipient
+        );
+    }
+
+    function _targetSelectors() internal view virtual returns (bytes4[] memory selectors) {
+        selectors = new bytes4[](31);
         selectors[0] = handler.createOrder.selector;
         selectors[1] = handler.fund.selector;
         selectors[2] = handler.fund.selector;
@@ -58,8 +68,6 @@ abstract contract TrustWorkIntegrationInvariantTest is StdInvariant, Integration
         selectors[28] = handler.warp.selector;
         selectors[29] = handler.roll.selector;
         selectors[30] = handler.donate.selector;
-        targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
-        targetContract(address(handler));
     }
 
     /// @dev II-01.
@@ -171,7 +179,7 @@ abstract contract TrustWorkIntegrationInvariantTest is StdInvariant, Integration
         }
     }
 
-    function afterInvariant() external {
+    function afterInvariant() public virtual {
         _logTransitions();
         handler.settleEverything();
         assertEq(court.pendingFees(), 0);
@@ -251,7 +259,7 @@ abstract contract TrustWorkIntegrationInvariantTest is StdInvariant, Integration
         invariant_AtMostOneDisputePerOrder();
     }
 
-    function _randomCall(uint256 seed) internal {
+    function _randomCall(uint256 seed) internal virtual {
         uint256 a = uint256(keccak256(abi.encode(seed, 1)));
         uint256 b = uint256(keccak256(abi.encode(seed, 2)));
         uint256 action = seed % 31;

@@ -1,6 +1,8 @@
 # Stage 4 — Test plan
 
-Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-design.md). No case is implemented.
+Status: test plan for [stage-4-reputation-design.md](stage-4-reputation-design.md), with the Stage 4B clarifications.
+The 4B cases of section 11 are implemented under `test/reputation/` and `test/invariant/TrustWorkReputation*.sol`;
+the 4C receipt cases are not implemented.
 
 ## 1. Conventions
 
@@ -25,7 +27,10 @@ Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-
 | RA-03 | `register` of a `WorkOrder` deployed directly with the factory's court reverts `UnknownOrder` |
 | RA-04 | `register` of an order created by a second `TrustWorkFactory` reverts `UnknownOrder` |
 | RA-05 | `register` of an EOA, of the court, of the registry and of a mock contract that mimics the `WorkOrder` views reverts `UnknownOrder`, and the mock's views are never called (call trace) |
-| RA-06 | `factsOf` and `claimReceipt` for an unregistered order revert `NotRegistered`; `receiptOf` of a never-minted ID reverts `ERC721NonexistentToken` |
+| RA-06 | `factsOf` for an unregistered order (genuine, unknown or zero address) reverts `NotRegistered` (4B) |
+| RA-07 | Canonical-court guard: an order recognized by the bound factory whose `court()` differs from `factory.court()` reverts `CourtMismatch(order, orderCourt)` (mock factory and order) |
+| RA-08 | Dispute link guard: a terminated order whose court dispute names another order, or another milestone index, reverts `InconsistentDispute(order, disputeId)` (mocks) |
+| RA-09 | Ruling guard: every ruling/reason pair other than the four the court produces (including `None/None`) reverts `UnsupportedRuling(order, ruling, reason)` (mocks) |
 
 ## 3. Eligibility table (one case per row, (2×))
 
@@ -42,9 +47,11 @@ Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-
 | RE-09 | `Terminated`, `ClientWins / Majority` | outcome `ClientWins` |
 | RE-10 | `Terminated`, `Split / NoDecision` by tie and by zero reveals | outcome `Split` |
 | RE-11 | `Terminated`, `FreelancerWins / NoPanel` from `AwaitingCandidates` and from `AwaitingSeed` | outcome `NoPanel`, never `FreelancerWins` |
-| RE-12 | Each terminal row above with the dispute or expiry at the first, middle and last milestone | `settledMilestones`, `disputedAmount`, `freelancerAwarded`, `clientReturned` per design §4 |
-| RE-13 | Claim independence: for every terminal outcome, register before any claim, after some claims and after all order and court claims (separate snapshots) | identical `records`, `factsOf`, counters and order lists |
+| RE-12 | Every feasible terminal position: `Completed` after all milestones; each ruling and `NoPanel` with the dispute at the first, middle and last milestone; delivery expiry at the middle and last milestone (expiry at the first remains ineligible, RE-06) | `settledMilestones`, `disputedAmount`, `freelancerAwarded`, `clientReturned` per design §4 |
+| RE-13 | Claim independence: for every terminal outcome, register before any claim, after some claims and after all order and court claims (separate snapshots, each registering at its own time) | identical outcome, business facts, counters and order lists; `registeredAt` equals each call's own block timestamp; complete records are compared only in a variant that registers at the same timestamp |
 | RE-14 | `closedNotBefore` per outcome equals the independently known value (last submission, delivery deadline, `revealDeadline`, `panelDeadline`); `fundedAt` equals the funding block time; `registeredAt` equals the registration block time and is reported separately |
+| RE-15 | Zero-timestamp submission: an order funded and submitted in a block with timestamp `0` (so `submittedAt == 0`) and then completed registers as `Completed`; participation comes from the first milestone's status, and `lastSubmittedAt` reports the true value |
+| RE-16 | Participation evidence by first-milestone status: `Disputed` (dispute at the first milestone) and `Settled` are accepted; `Pending` is rejected |
 
 ## 4. Unsolicited orders and participation evidence
 
@@ -65,7 +72,7 @@ Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-
 | --- | --- |
 | RS-01 | Each worked example row of design §5.4 (2×): exact facts and counters for client and freelancer roles |
 | RS-02 | Repeated registration of every outcome reverts `AlreadyRegistered`; counters, order lists and `registeredAt` unchanged |
-| RS-03 | Role overlap: fee recipient equal to the client, and to the freelancer: counters identical to the non-overlap case; fee recipient gets no stats or receipt |
+| RS-03 | Role overlap: fee recipient equal to the client, and to the freelancer. The fee-recipient position grants no additional entitlement (no extra counter, order-list entry or, in 4C, receipt); the address keeps exactly its client or freelancer role's normal entitlement, so counters equal the non-overlap case |
 | RS-04 | One account as freelancer in order A and client in order B: role stats are separate and each order list holds one entry |
 | RS-05 | Partition: `completed + deliveryExpired + freelancerWins + clientWins + splits + noPanel == registered` after a mixed sequence of registrations |
 | RS-06 | `milestonesSettled` sums `settledMilestones` over registered orders |
@@ -73,6 +80,8 @@ Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-
 | RS-08 | `ordersOf` paging: empty, partial, exact and out-of-range pages; registration order preserved |
 | RS-09 | Events: `OrderRegistered(order, outcome, client, freelancer)` exactly once per registration |
 | RS-10 | Odd disputed amount (`D = 7` units, `Split`): freelancer 3 units, client 4 units plus `R` |
+| RS-11 | `ordersOf` with `limit == 0`, `offset >= length`, `offset == type(uint256).max`, `limit == type(uint256).max` and both at maximum: empty or `min(limit, length - offset)` entries, never a revert |
+| RS-12 | `statsOf(account, role)` returns the full `Stats` struct; an account with no registrations returns all zeros |
 
 ## 6. Receipts
 
@@ -85,13 +94,14 @@ Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-
 | RR-03 | Claim after burn reverts `ReceiptAlreadyClaimed`; the token ID is never reissued |
 | RR-04 | Token IDs of all receipts across many orders are distinct; `receiptOf` inverts `receiptId` |
 | RR-05 | Event order at mint: `Transfer(0, holder, id)`, `Locked(id)`, `ReceiptClaimed`; `Unlocked` never emitted |
-| RR-06 | Claiming never changes records, counters or order lists |
+| RR-06 | Claiming never changes `outcome`, `registeredAt`, facts, counters or order lists; it sets exactly the claimed role's bit in `receiptsClaimed`, which never clears, including after burn |
+| RR-07 | `claimReceipt` for an unregistered order reverts `NotRegistered`; `receiptOf` of a never-minted ID reverts `ERC721NonexistentToken` |
 
 ### Transfer, approval and burn
 
 | ID | Case |
 | --- | --- |
-| RT-01 | `transferFrom`, `safeTransferFrom(from, to, id)` and `safeTransferFrom(from, to, id, data)` by the holder revert `ReceiptLocked(id)` |
+| RT-01 | `transferFrom`, `safeTransferFrom(from, to, id)` and `safeTransferFrom(from, to, id, data)` of an existing token by its holder to a nonzero recipient revert `ReceiptLocked(id)`; for nonexistent tokens and the zero recipient the standard `ERC721NonexistentToken` and `ERC721InvalidReceiver` errors are acceptable |
 | RT-02 | Same calls by a third party revert (lock check or authorization); ownership unchanged |
 | RT-03 | `approve` and `setApprovalForAll` revert `ApprovalsDisabled`; `getApproved` returns zero for existing and reverts for nonexistent tokens; `isApprovedForAll` is false |
 | RT-04 | `burn` by the holder succeeds: `Transfer(holder, 0, id)`, `balanceOf` decreases, `locked` and `ownerOf` revert afterwards; records and counters unchanged |
@@ -118,7 +128,7 @@ Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-
 
 | ID | Case |
 | --- | --- |
-| RU-01 | (2×) For every outcome: `register` and both `claimReceipt` calls leave every order, court and registry balance and counter, and every `claimable` credit, unchanged; no token `Transfer` is emitted |
+| RU-01 | (2×) For every outcome: `register` (4B) and both `claimReceipt` calls (4C) leave every order, court and registry balance, counter, credit, nonce and status unchanged, and emit no payment- or stake-token `Transfer`. The receipt contract's own ERC-721 mint and burn `Transfer` events in 4C are expected |
 | RU-02 | (2×) Settlement, `openDispute`, `resolve`, `applyRuling`, `claimPayout` and `claimReward` behave identically with the reputation contract deployed, absent, or holding records for the same orders |
 | RU-03 | (2×) Order and court claims succeed before and after registration and receipt claims, in either order |
 
@@ -136,30 +146,92 @@ Status: Stage 4A proposal for [stage-4-reputation-design.md](stage-4-reputation-
 | ID | Property |
 | --- | --- |
 | RF-01 | (2×) Sampled milestone amounts, `feeBps`, terminal path and disputed index: `factsOf` equals an independent model, `freelancerAwarded + clientReturned == totalAmount`, and counters change by exactly one outcome per role |
-| RF-02 | (2×) Sampled claim schedules before and after registration: identical records and facts (claim independence) |
-| RF-03 | Sampled `(order, role)` pairs: `receiptId` is injective and `receiptOf(receiptId(o, r)) == (o, r)` |
+| RF-02 | (2×) Sampled claim schedules before and after registration: identical classification, business facts, counters and order lists; `registeredAt` equals each registration's own timestamp |
+| RF-03 | Sampled distinct `(order, role)` pairs: `receiptId` is injective (pure function, no minted tokens needed) |
+| RF-04 | Sampled minted receipts: `receiptOf(receiptId(o, r)) == (o, r)` for every existing token |
 
 ## 10. Invariants (handler: Stage 3E integration actions plus register, claim receipt, burn, transfer attempts)
 
 | ID | Property |
 | --- | --- |
 | RI-01 | For every account and role, the outcome counters sum to `registered`, and `registered == orderCount(account, role)` |
-| RI-02 | Every registered order is a factory order, was final and had `submittedAt(0) != 0` at registration; its outcome equals the handler's ghost |
-| RI-03 | `records` and `factsOf` of a registered order never change afterwards |
+| RI-02 | Every registered order is a factory order, was final and had a first milestone that was not `Pending` at registration; its outcome equals the handler's ghost |
+| RI-03 | `outcome`, `registeredAt` and `factsOf` of a registered order never change afterwards; `receiptsClaimed` stays `0` in 4B and in 4C only gains bits |
 | RI-04 | Every existing receipt is locked and owned by its role holder; receipts are never transferred (ghost of `Transfer` events: only mints and burns) |
 | RI-05 | At most one mint per `(order, role)` over the whole campaign, burned or not |
 | RI-06 | The Stage 3E integration invariants II-01…II-08 hold unchanged with reputation actions interleaved |
 
 Campaign reports list registrations by outcome, rejected registrations by reason (`OrderNotFinal`,
-`NoParticipation`, `AlreadyRegistered`, `UnknownOrder`), receipts claimed and burned, and rejected transfers.
+`NoParticipation`, `AlreadyRegistered`, `UnknownOrder`), and in 4C receipts claimed and burned, and rejected transfers.
 
 ## 11. Slice acceptance
 
 | Slice | Cases |
 | --- | --- |
-| 4B | RA-01…RA-06, RE-01…RE-14, RG-01…RG-04, RG-06…RG-08, RS-01…RS-10, RU-01…RU-03 (registration part), RN-01…RN-04, RF-01, RF-02, RI-01…RI-03, RI-06 |
-| 4C | RG-05, RR-01…RR-06, RT-01…RT-05, RC-01…RC-04, RW-01…RW-03, RU-01 and RU-03 (receipt part), RF-03, RI-04, RI-05 |
+| 4B | RA-01…RA-09, RE-01…RE-16, RG-01…RG-04, RG-06…RG-08, RS-01…RS-12, RU-01…RU-03 (registration part), RN-01…RN-04, RF-01, RF-02, RI-01…RI-03, RI-06 |
+| 4C | RG-05, RR-01…RR-07, RT-01…RT-05, RC-01…RC-04, RW-01…RW-03, RU-01 and RU-03 (receipt part), RF-03, RF-04, RI-04, RI-05 |
 
 A slice is accepted only when `forge fmt --check`, `forge build` (diagnostics listed), `forge test` and
 `forge coverage` are reported from actual output, all its cases pass, earlier suites are unchanged in intent,
 production coverage of the new contract is 100% (or each gap explained), and sizes are within EIP-170.
+
+## 12. 4B implementation map
+
+All `test/reputation/TrustWorkReputation.t.sol` cases except the guard tests run in `SharedToken` and `SplitToken`
+(abstract suite with two concrete contracts). Expected facts come from `test/utils/ReputationTestBase.sol`, which
+drives production orders and records times and amounts itself.
+
+| Cases | Test (`test/reputation/TrustWorkReputation.t.sol` unless noted) |
+| --- | --- |
+| RA-01 | `test_Constructor_BindsFactoryAndHasNoAdministration` (also runtime below 24,576 B) |
+| RA-02 | `test_Register_AcceptsEligibleFactoryOrder` |
+| RA-03, RA-04, RA-05 | `test_RevertWhen_OrderNotCreatedByBoundFactory` (direct order, second factory, EOA, court, registry, zero address, and a mock mimicking order views that is never called: `vm.expectCall(mock, "", 0)`) |
+| RA-06 | `test_RevertWhen_FactsOfUnregisteredOrder` |
+| RA-07 | `TrustWorkReputationGuardTest.test_RevertWhen_OrderCourtDiffersFromFactoryCourt` |
+| RA-08 | `TrustWorkReputationGuardTest.test_RevertWhen_DisputeRecordInconsistent` |
+| RA-09 | `TrustWorkReputationGuardTest.test_RevertWhen_RulingReasonPairUnsupported` (all 16 pairs; 4 accepted) |
+| RE-01, RE-02, RG-03 | `test_RevertWhen_OrderUnfundedOrActive` |
+| RE-03, RE-04 | `test_RevertWhen_OrderDisputedUntilRulingApplied` |
+| RE-05, RE-14 | `test_Register_Completed`; times are asserted in every registration through `_register` |
+| RE-06, RG-01, RE-16 (`Pending`) | `test_RevertWhen_ExpiredBeforeAnySubmission` |
+| RE-07, RG-04 | `test_Register_DeliveryExpiredAfterParticipation` |
+| RE-08…RE-10, RE-16 | `test_Register_EveryRulingOutcome` |
+| RE-11, RE-16 (`Disputed`) | `test_Register_NoPanelFromBothWaitingStates` |
+| RE-12 | `test_Register_EveryFeasibleTerminalPosition` (asserts 18 cases: 5 rulings × 3 positions, 2 expiries, 1 completion) |
+| RE-13 | `test_Register_IndependentOfClaimTiming` |
+| RE-15 | `test_Register_ZeroTimestampSubmissionIsParticipation` |
+| RG-02 | `test_UnsolicitedOrders_NeverAffectInactiveVictim` |
+| RG-06 | `test_Hiding_LosingPartyCannotBlockOrUndo` |
+| RG-07, RG-08 | `test_WashAndNegligibleOrders_RegisterWithInspectableFacts` |
+| RS-01, RS-10 | `test_WorkedExamples` |
+| RS-02 | `test_RevertWhen_RegisteredTwice` (all six outcomes: four panel rulings and `NoPanel` at the middle milestone, `Completed`, and `DeliveryExpired` after participation) |
+| RS-03 | `test_RoleOverlap_FeeRecipientPositionGrantsNothing` |
+| RS-04 | `test_RoleStatistics_SeparatePerRole` |
+| RS-05, RS-06, RS-07, RS-09 | `test_Statistics_PartitionMilestonesAndDerivedShares` |
+| RS-08, RS-11, RS-12 | `test_OrdersOf_PagingBoundaries` |
+| RU-01 | `test_Register_LeavesEscrowCourtAndRegistryUnchanged` |
+| RU-02, RU-03 | `test_Claims_IdenticalWithOrWithoutRegistration` |
+| RN-01 | `test_NearMaximumTotal_EveryOutcome` (order total `type(uint256).max - 1e15`; `Completed`, `DeliveryExpired`, `FreelancerWins`, `ClientWins`, `Split` by tie and by zero reveals, `NoPanel`; 7 cases) |
+| RN-02 | `test_AggregateVolumeAboveUint256_RegistersBothOrders` (two completed orders, same factory, parties and token, each `type(uint256).max - 1e15`; the second funded by recycling the first's payouts; asserts `firstTotal > type(uint256).max - secondTotal`) |
+| RN-03 | `test_UnitMilestonesAndFeeBounds` |
+| RN-04 | `test_ManyMilestones_Completed` |
+| RF-01 | `TrustWorkReputation.fuzz.t.sol`: `testFuzz_FactsMatchModel` |
+| RF-02 | `testFuzz_ClaimScheduleDoesNotChangeFacts` |
+| RI-01 | `test/invariant/TrustWorkReputation.invariant.t.sol`: `invariant_CountersPartitionRegistrations` |
+| RI-02 | `invariant_RegisteredOrdersWereEligible` |
+| RI-03 | `invariant_RecordsAndFactsNeverChange` |
+| RI-06 | the inherited `invariant_*` of `TrustWorkIntegration.invariant.t.sol` (II-01…II-08) |
+
+The reputation handler extends the Stage 3E integration handler. Every registration attempt also asserts that the
+order's status, nonce, counters and credits and the court's and registry's counters and balances are unchanged.
+`test_RandomCampaignsRegisterEveryOutcome` replays 32 fixed campaigns of 128 calls with registrations interleaved,
+checks all Stage 3E and reputation invariants after every call, registers every order at the end, and requires every
+outcome and every rejection reason (`OrderNotFinal`, `NoParticipation`, `AlreadyRegistered`, `UnknownOrder`). The
+inherited Stage 3E replay keeps its original call mix. `TrustWorkReputation.gas.t.sol` reports registration gas for
+representative outcomes without a threshold.
+
+Invariant results are reported per configured campaign: `runs = 256`, `depth = 64` (`foundry.toml`), so each
+campaign makes 16,384 handler calls, and Foundry 1.5.1 prints one line per declared invariant property with the
+campaign's call and revert counts. Declared properties (functions), concrete property executions (a property in each
+concrete contract) and campaign results are counted separately; newer Foundry versions may group properties and
+report different totals.

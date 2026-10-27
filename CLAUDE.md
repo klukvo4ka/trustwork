@@ -70,11 +70,22 @@ Stage 3E (accepted, `8c55497`): slice S4 — production order and factory integr
 - `approvalNonce == settledCount + (Disputed || Terminated ? 1 : 0)`; EIP-712 message and domain unchanged.
 - `ArbitrationCourt`, `ArbitratorRegistry`, their interfaces and `PanelSelection` are unchanged.
 
-Stage 4A (current): design only — reputation and soulbound receipts in `docs/stage-4-reputation-design.md` and
-`docs/stage-4-test-plan.md`. No Solidity is authorized yet; implementation follows slices 4B and 4C, each authorized
-and reviewed separately.
+Stage 4A (accepted, `c14d760`, with the clarifications recorded in Stage 4B): reputation and soulbound receipts design
+in `docs/stage-4-reputation-design.md` and `docs/stage-4-test-plan.md`; implementation in slices 4B and 4C.
 
-Out of scope until a later stage explicitly asks for it: implementation of the Stage 4 reputation design; appeals,
+Stage 4B (current): `TrustWorkReputation` and `ITrustWorkReputation` — registration, facts and statistics only.
+
+- Immutable `factory`; no owner, setters, fees, pause, upgrade or rescue; no token transfer and no state-changing
+  external call. Escrow, court and registry never call it.
+- `register(order)`: anyone, once; `factory.isWorkOrder` before any call to the order; `CourtMismatch`,
+  `OrderNotFinal` (including `Disputed` after court resolution), `NoParticipation` (first milestone `Pending`),
+  `InconsistentDispute`, `UnsupportedRuling`.
+- Six distinct outcomes; `NoPanel` never counts as `FreelancerWins`. Facts from final order and court state only;
+  gross amounts with `freelancerAwarded + clientReturned == totalAmount`; `registeredAt` is not the closing time.
+- Per-account, per-role `Stats` through `statsOf`; `orderCount` and bounded `ordersOf`; no monetary aggregate.
+- `receiptsClaimed` stays `0`; no ERC-721 or receipt functions until 4C.
+
+Out of scope until a later stage explicitly asks for it: Stage 4C receipts (ERC-721/ERC-5192, claim, burn); appeals,
 resubmission or continuation after a dispute; cancellation by agreement and other refunds; recovery of unsolicited
 tokens, governance, frontend, deployment scripts (Base Sepolia comes later), and any relayer service. Do not add
 placeholder functions or hooks for these.

@@ -2,9 +2,10 @@
 
 Milestone-based escrow for freelance work, written in Solidity with Foundry and OpenZeppelin Contracts v5.
 
-> **Status:** Stage 3 (escrow, arbitration and order integration) of a portfolio project is accepted. The Stage 4A
-> reputation design is proposed ([design](docs/stage-4-reputation-design.md), [test plan](docs/stage-4-test-plan.md))
-> and not implemented. Unaudited and intended for local development and testnets only. Do not use it with real funds.
+> **Status:** Stage 4B (reputation registration and statistics) of a portfolio project. Stage 3 and the Stage 4A
+> design ([design](docs/stage-4-reputation-design.md), [test plan](docs/stage-4-test-plan.md)) are accepted;
+> soulbound receipts (slice 4C) are not implemented. Unaudited and intended for local development and testnets only.
+> Do not use it with real funds.
 
 ## Architecture
 
@@ -14,6 +15,7 @@ Milestone-based escrow for freelance work, written in Solidity with Foundry and 
 | `WorkOrder`        | Holds one engagement's budget and releases it milestone by milestone; a disputed milestone ends the order with the court's ruling. |
 | `ArbitrationCourt` | Disputes opened by the factory's orders: candidate snapshot, panel draw, commit-reveal voting, rulings, fee and penalty credits. |
 | `ArbitratorRegistry` | Stake ledger and per-dispute candidate snapshots, deployed by and used only by the court. |
+| `TrustWorkReputation` | Optional, standalone: permissionless registration of final factory orders and factual per-account statistics. Nothing in the escrow, court or registry calls it. |
 
 Each order is its own contract, so funds and state of different engagements never mix. There is no owner, admin,
 upgrade path, or pause switch. Escrowed tokens leave an order only through settlement (to the fee recipient and the
@@ -576,6 +578,61 @@ with `--isolate`, in both token configurations (target ≤ 2,000,000).
 
 `test_Sizes_WithinDeploymentLimits` checks the deployed runtimes and the factory initcode in the ordinary build.
 
+## Reputation
+
+`TrustWorkReputation(factory)` is slice 4B of the Stage 4 design
+([`docs/stage-4-reputation-design.md`](docs/stage-4-reputation-design.md)). It is bound to one immutable
+`TrustWorkFactory`, has no owner, setter, fee, pause, upgrade or rescue function, never moves tokens, and only makes
+view calls to the factory, the order and the factory's court. Deploying it, or not, changes nothing in escrow,
+arbitration or claims.
+
+**Registration.** `register(order)` can be called by anyone, once per order:
+
+1. `factory.isWorkOrder(order)` must be true (`UnknownOrder`); this is checked before any call to `order`. Directly
+   deployed orders, orders of other factories and arbitrary contracts are rejected.
+2. Not registered yet (`AlreadyRegistered`).
+3. The order's `court()` equals `factory.court()` (`CourtMismatch`; cannot fail for factory orders).
+4. The order is `Completed` or `Terminated` (`OrderNotFinal`). A `Disputed` order is not eligible even after the
+   court has resolved; anyone can call `applyRuling` first. Registration never calls it.
+5. The first milestone is no longer `Pending` (`NoParticipation`). Only the freelancer's submission moves it out of
+   `Pending`, so an unsolicited order whose named freelancer never acted can never be registered and cannot affect
+   that address.
+6. For a dispute, the court's record must name this order and its current milestone (`InconsistentDispute`) and carry
+   one of the four ruling/reason pairs the court produces (`UnsupportedRuling`).
+
+**Outcomes.** `Completed`, `DeliveryExpired` (the client reclaimed after the freelancer had delivered at least once),
+`FreelancerWins` and `ClientWins` (panel majority), `Split` (formed panel, no majority) and `NoPanel` (no panel
+formed; the submitted milestone was paid by default). `NoPanel` is never counted as a win, and `Completed` is not a
+quality rating.
+
+**Facts.** `factsOf(order)` recomputes, from final order and court state only, the parties, token, outcome,
+milestone counts, `totalAmount`, `settledAmount` (`directPaid`), `disputedAmount`, `freelancerAwarded` and
+`clientReturned` (gross amounts in the order's token, with `freelancerAwarded + clientReturned == totalAmount`;
+`freelancerAwarded` includes the protocol-fee portion and is not the freelancer's net receipt), the dispute ID,
+`fundedAt` and `lastSubmittedAt` (exact), and `closedNotBefore` (a lower bound of the closing time). It never reads
+payout credits, `claimsPaid`, `outstandingObligations` or balances, so registering before or after any claim yields
+the same facts. `records(order)` stores only the outcome and `registeredAt`, the registration time, which is not the
+closing time; `receiptsClaimed` is always `0` until receipts exist.
+
+**Statistics.** `statsOf(account, role)` returns, separately for the client and freelancer roles, `registered`, one
+counter per outcome and `milestonesSettled`. The fee-recipient position gives no statistics. No monetary amount is
+ever summed across orders, so near-`uint256` orders cannot overflow anything. `orderCount` and
+`ordersOf(account, role, offset, limit)` list registered orders in registration order: `ordersOf` returns an empty
+array for `limit == 0` or `offset >= length`, otherwise `min(limit, length - offset)` entries, without computing
+`offset + limit`.
+
+**Meaning and limits.** Registration is voluntary, so statistics describe registered orders only and are biased
+toward orders someone wanted on record. Wash orders between addresses one person controls, worthless tokens and
+negligible amounts are possible and are not detected; every order's token, amounts and counterparty are exposed so
+consumers can filter. There is no Sybil resistance, identity or quality signal.
+
+**Gas** (`test/reputation/TrustWorkReputation.gas.t.sol`, storage cooled before the call, reported without a
+threshold): first registration for both accounts 284,560 (`Completed`), 287,169 (`DeliveryExpired`), 306,835
+(`FreelancerWins`), 307,196 (`Split`), 306,909 (`NoPanel`); 125,360 for `Completed` when both accounts already have a
+registration. With `--isolate`: 310,992, 313,601, 335,767, 336,128, 335,841 and 174,192.
+
+Size: `TrustWorkReputation` runtime 7,207 B, initcode 7,448 B.
+
 ## Development
 
 Toolchain: Foundry 1.5.1-stable, solc 0.8.28 (EVM `cancun`), OpenZeppelin Contracts v5.6.1, forge-std v1.11.0.
@@ -600,7 +657,10 @@ order. Production integration tests live in `test/integration/` (unit cases I-01
 and `test/invariant/TrustWorkIntegration*.sol`. Each runs twice, with one token for escrow and stake
 (`SharedToken`) and with separate tokens (`SplitToken`). `test/utils/TransferLedger.sol` records every token
 transfer during each protocol action, requires it to match the edges the test's own model expects for that
-transition, and keeps an independent per-contract ledger of liabilities and unsolicited balance.
+transition, and keeps an independent per-contract ledger of liabilities and unsolicited balance. Reputation tests live in
+`test/reputation/` (unit, fuzz, gas; `MockReputationSources.sol` reaches the three consistency guards that the
+accepted contracts cannot trigger) and `test/invariant/TrustWorkReputation*.sol`, which runs the Stage 3E integration
+campaign with registrations interleaved, in both token configurations.
 `test/WorkOrder.delivery.t.sol` also contains a deterministic matrix of every funding path × reclaim at the first,
 middle and last milestone (9 cases); fuzz and invariant runs sample combinations rather than enumerating them. Mocks under `test/mocks/`
 are test-only: `MockUSDC` (6 decimals, open minting), `MockPermitUSDC` (adds ERC-2612), a fee-on-transfer token, a
@@ -628,7 +688,7 @@ Not implemented in this stage:
 - appeals, resubmission after a dispute, or more than one dispute per order;
 - cancellation by agreement, and any refund other than delivery-expiry reclaim;
 - recovery of unsolicited tokens sent directly to an order;
-- reputation and soulbound receipts (designed in [`docs/stage-4-reputation-design.md`](docs/stage-4-reputation-design.md),
+- soulbound receipts (designed in [`docs/stage-4-reputation-design.md`](docs/stage-4-reputation-design.md), slice 4C,
   not implemented), governance, frontend, deployment scripts, and a relayer service.
 
 Stage 2 caveats:
@@ -654,5 +714,11 @@ Stage 3E caveats:
 - Orders from the Stage 1/2 factories have no court and cannot be disputed; the Stage 3 factory does not adopt them.
 - The status enums changed: `OrderStatus` gains `Disputed` before `Completed`, so `Completed` and `Terminated` have
   new numeric values, and `MilestoneStatus` gains `Disputed` at the end.
+
+Stage 4B caveats:
+
+- Registered history is incomplete and voluntarily selected; counters are not statistics over all orders.
+- The closing time is not on-chain state; only `closedNotBefore` and `registeredAt` bound it.
+- Orders left `Active` or `Disputed` forever never become eligible.
 
 The milestone count has no explicit cap; creation gas grows linearly with it and is paid by the client.
