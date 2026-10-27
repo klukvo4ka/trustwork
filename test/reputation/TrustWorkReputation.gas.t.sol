@@ -2,10 +2,11 @@
 pragma solidity 0.8.28;
 
 import {console} from "forge-std/console.sol";
+import {ITrustWorkReputation} from "../../src/interfaces/ITrustWorkReputation.sol";
 import {ReputationTestBase} from "../utils/ReputationTestBase.sol";
 
-/// @dev Reports `register` gas for representative outcomes; there is no acceptance threshold. The reputation,
-/// factory, order and court storage is marked cold with `vm.cool` before the measured call.
+/// @dev Reports `register`, `claimReceipt` and `burn` gas for representative cases; there is no acceptance threshold.
+/// The reputation, factory, order and court storage is marked cold with `vm.cool` before the measured call.
 contract TrustWorkReputationGasTest is ReputationTestBase {
     function _sharedToken() internal pure override returns (bool) {
         return true;
@@ -43,5 +44,41 @@ contract TrustWorkReputationGasTest is ReputationTestBase {
         vm.cool(address(court));
         reputation.register(address(second.order));
         console.log("register, Completed, accounts already registered once:", vm.lastCallGas().gasTotalUsed);
+    }
+
+    function test_Gas_ClaimAndBurnReceipts() public {
+        Scenario memory s = _completed(_defaultAmounts());
+        reputation.register(address(s.order));
+        _coolAll(address(s.order));
+        vm.prank(client);
+        uint256 clientId = reputation.claimReceipt(address(s.order), ITrustWorkReputation.Role.Client);
+        console.log("claimReceipt, client, first receipt of the account:", vm.lastCallGas().gasTotalUsed);
+        _coolAll(address(s.order));
+        vm.prank(freelancer);
+        reputation.claimReceipt(address(s.order), ITrustWorkReputation.Role.Freelancer);
+        console.log("claimReceipt, freelancer, first receipt of the account:", vm.lastCallGas().gasTotalUsed);
+
+        Scenario memory second = _completed(_defaultAmounts());
+        reputation.register(address(second.order));
+        _coolAll(address(second.order));
+        vm.prank(client);
+        uint256 secondId = reputation.claimReceipt(address(second.order), ITrustWorkReputation.Role.Client);
+        console.log("claimReceipt, client, account already holds a receipt:", vm.lastCallGas().gasTotalUsed);
+
+        _coolAll(address(s.order));
+        vm.prank(client);
+        reputation.burn(clientId);
+        console.log("burn, holder keeps another receipt:", vm.lastCallGas().gasTotalUsed);
+        _coolAll(address(second.order));
+        vm.prank(client);
+        reputation.burn(secondId);
+        console.log("burn, holder's last receipt:", vm.lastCallGas().gasTotalUsed);
+    }
+
+    function _coolAll(address order) private {
+        vm.cool(address(reputation));
+        vm.cool(address(factory));
+        vm.cool(order);
+        vm.cool(address(court));
     }
 }

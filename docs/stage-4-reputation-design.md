@@ -1,9 +1,9 @@
 # Stage 4 — Reputation and soulbound receipts design
 
 Status: Stage 4A design (accepted with the clarifications of Stage 4B). Slice 4B — registration, facts and
-statistics — is implemented in `src/TrustWorkReputation.sol` and `src/interfaces/ITrustWorkReputation.sol`.
-Receipts (sections 6.2 and 6.3, slice 4C) are **not implemented**; their interfaces and pseudocode remain design
-material.
+statistics — (accepted, `1cb0e3f`) and slice 4C — receipts, sections 6.2 and 6.3 — are implemented in
+`src/TrustWorkReputation.sol`, `src/interfaces/ITrustWorkReputation.sol` and `src/interfaces/IERC5192.sol`. Decisions
+U1, U2 and U6 are resolved as recommended (section 9).
 Baseline: Stage 3E, commit `8c5549772b6561f0118644d8a71ee23d9e6cf205` (escrow, arbitration and production
 integration accepted).
 
@@ -365,11 +365,14 @@ emit OrderRegistered
   change. The record is final.
 - Registration makes no token transfer and no state-changing external call, so it needs no reentrancy guard. Its only
   external calls are `view` calls to the factory and to the order and court that the factory authenticated.
+- The contract never calls or moves an ERC-20 token. In 4C its only token events are its own ERC-721 `Transfer`
+  events for receipt mints and burns; no order, court or registry token moves.
 
 ### 6.2 Receipts
 
 - **Recipients:** the order's client (`Role.Client`) and freelancer (`Role.Freelancer`), each at most one receipt per
-  registered order. The fee recipient, arbitrators and third parties get none.
+  registered order. The fee recipient, arbitrators and third parties get none. The fee-recipient position grants no
+  additional receipt; an address that is also the client or the freelancer keeps that role's ordinary entitlement.
 - **Consent:** receipts are never pushed. `claimReceipt(order, role)` requires `msg.sender` to be that role's address;
   nobody can place a receipt in someone else's wallet. Claiming is optional and works for every outcome.
 - **Token ID:** `receiptId(order, role) = (uint256(uint160(order)) << 1) | uint256(role)`. It is deterministic and
@@ -412,12 +415,12 @@ interface IERC5192 {
 Everything a receipt describes is immutable: its `(order, role)` is fixed by its ID, and the order's facts are final.
 
 **Tradeoff (burnable).** A holder can remove a receipt from their wallet, which respects consent. It cannot hide the
-outcome, because records and counters stay and the receipt cannot be reissued. **Unresolved decision U1:** whether
-burning should be disallowed entirely.
+outcome, because records and counters stay and the receipt cannot be reissued. **Decision U1 (resolved in 4C):**
+holders may burn their own receipts.
 
 **Tradeoff (empty `tokenURI`).** On-chain JSON would need string and Base64 encoding code with little review value at
-this stage; off-chain URIs would need an administrator. Wallets show the receipt without an image. **Unresolved
-decision U2:** an on-chain JSON `tokenURI` as an optional later slice.
+this stage; off-chain URIs would need an administrator. Wallets show the receipt without an image. **Decision U2
+(resolved in 4C):** `tokenURI` is empty; an on-chain JSON `tokenURI` remains the optional slice 4D.
 
 ## 7. Griefing, consent, bias and manipulation
 
@@ -466,23 +469,23 @@ are a curated selection; the counters are the less biased view.
 - Stage 1/2 orders and orders of any other factory cannot be registered.
 - A contract role holder that cannot initiate calls cannot claim a receipt.
 
-## 9. Unresolved decisions
+## 9. Decisions
 
 | ID | Decision | Recommendation in this design |
 | --- | --- | --- |
-| U1 | Allow holder burn | yes; records unaffected, no reissue |
-| U2 | `tokenURI` content | empty in 4C; optional on-chain JSON later |
+| U1 | Allow holder burn | yes; records unaffected, no reissue (resolved in 4C) |
+| U2 | `tokenURI` content | empty in 4C; optional on-chain JSON later (resolved in 4C: empty) |
 | U3 | Restrict registration to participants | no; permissionless, to limit hiding |
 | U4 | Per-token monetary aggregates on-chain | no; off-chain from per-order facts |
 | U5 | Client-role statistics | keep; same counters, separate role |
-| U6 | Receipt for the fee recipient | no; not a participant |
+| U6 | Receipt for the fee recipient | no; not a participant (resolved in 4C: no additional receipt for the position) |
 
 ## 10. Implementation slices
 
 | Slice | Content | Acceptance |
 | --- | --- | --- |
-| 4B (implemented) | `TrustWorkReputation` registration: factory binding, eligibility, participation rule, classification, `factsOf`, records, counters, order lists, events and errors; no ERC-721 | the 4B cases of test plan §11 pass, (2×) cases in both token configurations; escrow, court and registry counters and balances unchanged by registration; 100% line and branch coverage of the new contract; `forge fmt --check`, `forge build`, `forge test`, `forge coverage` reported |
-| 4C | Receipts: ERC-721 base, ERC-5192 `locked` and `Locked`, `claimReceipt`, deterministic IDs, `_update` lock, disabled approvals, holder burn, `supportsInterface`, empty `tokenURI` | the 4C cases of test plan §11 pass; no receipt operation can affect order or court state; runtime below 24,576 B; same command reporting |
+| 4B (accepted, `1cb0e3f`) | `TrustWorkReputation` registration: factory binding, eligibility, participation rule, classification, `factsOf`, records, counters, order lists, events and errors; no ERC-721 | the 4B cases of test plan §11 pass, (2×) cases in both token configurations; escrow, court and registry counters and balances unchanged by registration; 100% line and branch coverage of the new contract; `forge fmt --check`, `forge build`, `forge test`, `forge coverage` reported |
+| 4C (implemented) | Receipts: ERC-721 base, ERC-5192 `locked` and `Locked`, `claimReceipt`, deterministic IDs, `_update` lock, disabled approvals, holder burn, `supportsInterface`, empty `tokenURI` | the 4C cases of test plan §11 pass; no receipt operation can affect order or court state; runtime below 24,576 B; same command reporting |
 | 4D (optional) | On-chain JSON `tokenURI` (decision U2) | only if authorized after 4C review |
 
 Each slice is reviewed before the next begins. Accepted contracts (`WorkOrder`, `TrustWorkFactory`,

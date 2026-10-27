@@ -6,7 +6,8 @@ import {TrustWorkFactory} from "../TrustWorkFactory.sol";
 import {WorkOrder} from "../WorkOrder.sol";
 
 /// @title ITrustWorkReputation
-/// @notice Factual records and per-account statistics of final orders created by one TrustWork factory.
+/// @notice Factual records and per-account statistics of final orders created by one TrustWork factory, and optional
+/// nontransferable receipts for their client and freelancer.
 interface ITrustWorkReputation {
     enum Outcome {
         None,
@@ -61,6 +62,7 @@ interface ITrustWorkReputation {
     }
 
     event OrderRegistered(address indexed order, Outcome outcome, address indexed client, address indexed freelancer);
+    event ReceiptClaimed(address indexed order, Role role, address indexed holder, uint256 tokenId);
 
     error ZeroFactory();
     error FactoryHasNoCode(address factory);
@@ -72,6 +74,10 @@ interface ITrustWorkReputation {
     error InconsistentDispute(address order, uint256 disputeId);
     error UnsupportedRuling(address order, IArbitrationCourt.Ruling ruling, IArbitrationCourt.RulingReason reason);
     error NotRegistered(address order);
+    error NotRoleHolder(address order, Role role, address caller);
+    error ReceiptAlreadyClaimed(address order, Role role);
+    error ReceiptLocked(uint256 tokenId);
+    error ApprovalsDisabled();
 
     function factory() external view returns (TrustWorkFactory);
     function register(address order) external returns (Outcome outcome);
@@ -83,4 +89,8 @@ interface ITrustWorkReputation {
         external
         view
         returns (address[] memory page);
+    function claimReceipt(address order, Role role) external returns (uint256 tokenId);
+    function burn(uint256 tokenId) external;
+    function receiptId(address order, Role role) external pure returns (uint256);
+    function receiptOf(uint256 tokenId) external view returns (address order, Role role);
 }

@@ -73,9 +73,9 @@ Stage 3E (accepted, `8c55497`): slice S4 — production order and factory integr
 Stage 4A (accepted, `c14d760`, with the clarifications recorded in Stage 4B): reputation and soulbound receipts design
 in `docs/stage-4-reputation-design.md` and `docs/stage-4-test-plan.md`; implementation in slices 4B and 4C.
 
-Stage 4B (current): `TrustWorkReputation` and `ITrustWorkReputation` — registration, facts and statistics only.
+Stage 4B (accepted, `1cb0e3f`): `TrustWorkReputation` and `ITrustWorkReputation` — registration, facts and statistics.
 
-- Immutable `factory`; no owner, setters, fees, pause, upgrade or rescue; no token transfer and no state-changing
+- Immutable `factory`; no owner, setters, fees, pause, upgrade or rescue; no ERC-20 call or transfer and no state-changing
   external call. Escrow, court and registry never call it.
 - `register(order)`: anyone, once; `factory.isWorkOrder` before any call to the order; `CourtMismatch`,
   `OrderNotFinal` (including `Disputed` after court resolution), `NoParticipation` (first milestone `Pending`),
@@ -83,9 +83,22 @@ Stage 4B (current): `TrustWorkReputation` and `ITrustWorkReputation` — registr
 - Six distinct outcomes; `NoPanel` never counts as `FreelancerWins`. Facts from final order and court state only;
   gross amounts with `freelancerAwarded + clientReturned == totalAmount`; `registeredAt` is not the closing time.
 - Per-account, per-role `Stats` through `statsOf`; `orderCount` and bounded `ordersOf`; no monetary aggregate.
-- `receiptsClaimed` stays `0`; no ERC-721 or receipt functions until 4C.
 
-Out of scope until a later stage explicitly asks for it: Stage 4C receipts (ERC-721/ERC-5192, claim, burn); appeals,
+Stage 4C (current): optional soulbound receipts in `TrustWorkReputation`, `ITrustWorkReputation` and a local `IERC5192`.
+
+- OpenZeppelin `ERC721` "TrustWork Receipt" / "TWR"; the constructor still takes only the factory.
+- `claimReceipt(order, role)`: registered order (`NotRegistered`), `msg.sender` is that role's holder (`NotRoleHolder`),
+  every outcome; the role's bit in `receiptsClaimed` is set before `_mint` (no callback) and never cleared, so repeat
+  claims revert `ReceiptAlreadyClaimed`, also after burn. Events `Transfer`, `Locked`, `ReceiptClaimed`. No automatic
+  mint or registration, no recipient parameter; the fee-recipient position grants nothing.
+- `receiptId(order, role) = (uint160(order) << 1) | role`; `receiptOf` reverts `ERC721NonexistentToken` unless the
+  token exists.
+- `_update` allows only mint and burn (`ReceiptLocked`); `approve` and `setApprovalForAll` revert `ApprovalsDisabled`;
+  holder-only `burn` (U1) keeps records, statistics and claim bits; `locked` true for existing tokens; `tokenURI` empty
+  (U2); `supportsInterface` adds ERC-5192 `0xb45a3c0e`.
+- The contract never calls or moves ERC-20 tokens; its only token events are its own receipt mints and burns.
+
+Out of scope until a later stage explicitly asks for it: Stage 4D on-chain JSON `tokenURI`; appeals,
 resubmission or continuation after a dispute; cancellation by agreement and other refunds; recovery of unsolicited
 tokens, governance, frontend, deployment scripts (Base Sepolia comes later), and any relayer service. Do not add
 placeholder functions or hooks for these.

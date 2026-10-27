@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IArbitrationCourt} from "./interfaces/IArbitrationCourt.sol";
+import {IERC5192} from "./interfaces/IERC5192.sol";
 import {ITrustWorkReputation} from "./interfaces/ITrustWorkReputation.sol";
 import {TrustWorkFactory} from "./TrustWorkFactory.sol";
 import {WorkOrder} from "./WorkOrder.sol";
 
 /// @title TrustWorkReputation
 /// @notice Permissionless registry of final orders created by one TrustWork factory, with factual per-account,
-/// per-role counters. Registered history is only the orders someone chose to register.
-/// @dev Reads only final order and court state, through view calls; never moves tokens and is never called by the
-/// escrow, court or registry.
-contract TrustWorkReputation is ITrustWorkReputation {
+/// per-role counters, and optional ERC-5192 receipts that the order's client and freelancer may each claim once.
+/// Registered history is only the orders someone chose to register.
+/// @dev Reads only final order and court state, through view calls; never moves ERC-20 tokens and is never called by
+/// the escrow, court or registry. Its own receipts can only be minted and burned, never transferred.
+contract TrustWorkReputation is ITrustWorkReputation, IERC5192, ERC721 {
     TrustWorkFactory public immutable factory;
 
     mapping(address order => OrderRecord) public records;
     mapping(address account => mapping(Role role => Stats)) private _stats;
     mapping(address account => mapping(Role role => address[])) private _orders;
 
-    constructor(TrustWorkFactory factory_) {
+    constructor(TrustWorkFactory factory_) ERC721("TrustWork Receipt", "TWR") {
         if (address(factory_) == address(0)) revert ZeroFactory();
         if (address(factory_).code.length == 0) revert FactoryHasNoCode(address(factory_));
         factory = factory_;
@@ -71,6 +74,69 @@ contract TrustWorkReputation is ITrustWorkReputation {
         for (uint256 i; i < page.length; ++i) {
             page[i] = list[offset + i];
         }
+    }
+
+    /// @notice Mints the caller's receipt for `role` of a registered order. Each `(order, role)` gets at most one
+    /// receipt over its lifetime, also after a burn.
+    /// @dev Minted without a receiver callback, so any account that can make this call can hold the receipt.
+    function claimReceipt(address order, Role role) external returns (uint256 tokenId) {
+        OrderRecord storage record = records[order];
+        if (record.outcome == Outcome.None) revert NotRegistered(order);
+        address holder = role == Role.Client ? WorkOrder(order).client() : WorkOrder(order).freelancer();
+        if (msg.sender != holder) revert NotRoleHolder(order, role, msg.sender);
+        uint8 bit = uint8(1) << uint8(role);
+        if (record.receiptsClaimed & bit != 0) revert ReceiptAlreadyClaimed(order, role);
+
+        record.receiptsClaimed |= bit;
+        tokenId = receiptId(order, role);
+        _mint(msg.sender, tokenId);
+
+        emit Locked(tokenId);
+        emit ReceiptClaimed(order, role, msg.sender, tokenId);
+    }
+
+    /// @notice Destroys the caller's receipt. The order's record, facts and statistics are unaffected, and the receipt
+    /// can never be claimed again.
+    function burn(uint256 tokenId) external {
+        _update(address(0), tokenId, msg.sender);
+    }
+
+    function receiptId(address order, Role role) public pure returns (uint256) {
+        return (uint256(uint160(order)) << 1) | uint256(role);
+    }
+
+    /// @notice Order and role of an existing receipt; reverts for IDs that were never minted or were burned.
+    function receiptOf(uint256 tokenId) external view returns (address order, Role role) {
+        _requireOwned(tokenId);
+        return (address(SafeCast.toUint160(tokenId >> 1)), Role(tokenId & 1));
+    }
+
+    function locked(uint256 tokenId) external view returns (bool) {
+        _requireOwned(tokenId);
+        return true;
+    }
+
+    function approve(address, uint256) public pure override {
+        revert ApprovalsDisabled();
+    }
+
+    function setApprovalForAll(address, bool) public pure override {
+        revert ApprovalsDisabled();
+    }
+
+    function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
+        return interfaceId == type(IERC5192).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /// @dev Allows only minting and burning. An ordinary transfer of an existing token first passes the inherited
+    /// authorization check, then reverts `ReceiptLocked`; transfers of nonexistent tokens fail authorization.
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
+        address from = _ownerOf(tokenId);
+        if (from != address(0) && to != address(0)) {
+            if (auth != address(0)) _checkAuthorized(from, auth, tokenId);
+            revert ReceiptLocked(tokenId);
+        }
+        return super._update(to, tokenId, auth);
     }
 
     function _facts(WorkOrder order) private view returns (OrderFacts memory facts) {
